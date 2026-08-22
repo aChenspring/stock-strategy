@@ -1,0 +1,743 @@
+--- line 15 ---
+15:     get_price,
+16:     get_bars,
+17:     get_ticks,
+18:     get_last_tick,
+19:     get_fundamentals,
+20:     query,
+21:     cash_flow,
+22: )
+23: ```
+24: 
+25: 本地行情优先使用 `rd`。在线接口只用于本地数据库没有的数据，不能用在线接口暴力替代本地批量行情。
+26: 
+27: 
+28: 推荐方式是：
+29: 
+30: ```python
+31: from stock_sdk import *
+32: ```
+33: 
+34: 
+35: ---
+36: 
+37: ## 1. AI 必须遵守的规则
+38: 
+39: 1. `rd` 是分层 K-V 数据库，不是 SQL，也不是 REST 路由猜测器。先确定 `table + K1 + K2...`，再调用。
+40: 2. 日K和分钟K的固定模板是 `rd.get/vals("日k或分钟k", code, date_query)`，不能省略 `code` 或 `date_query`。
+41: 3. 禁止用 `rd.get("日k")`、`rd.get("日k", "all")`、`rd.get("日k", code)` 反复试错。
+42: 4. 字符串 `"all"` 不是通配符。整层匹配使用 `"*"`；前缀匹配使用 `"6*"`、`"202606*"`。
+43: 5. 精确读取单条值用 `rd.get()`；读取匹配结果中的值集合优先用 `rd.vals()`；只要完整键名用 `rd.keys()`。
+44: 6. `rd.vals(...).get("date,code,close")` 是服务端字段投影，不是 Python 端二次筛选。
+45: 7. 对查询对象先切片、再执行。`query[:100]`、`query[-100:]` 会进入请求参数；不要先全量下载再切片。
+46: 8. 大范围查询使用代码前缀，让服务器筛选，例如 `rd.vals("日k", "6*", date_query)`；不得循环五千个代码逐股请求。
+47: 9. 需要复权、周/月K或分钟聚合时使用 `rd.get_data()`，不要重新手写复权和周期合成。
+48: 10. Python 版 `zb.get()` 既支持股票代码，也支持 `rd.get_data(fields=None)` 的对象行；传入原始行情时直接计算，不得再次请求或二次复权。
+49: 11. 在线 `get_price/get_ticks/...` 默认按单标的小数据量使用。当前在线服务会限制批量代码请求。
+50: 12. 在线接口可能以 `{"error": "..."}` 返回业务错误，不一定抛异常；必须检查返回值。
+51: 13. 同一查询结果应缓存。界面排序、筛选、翻页和重绘不得重复拉取数据。
+52: 14. 股票代码始终使用字符串，例如 `'000001'`，不能写成整数 `1`。
+53: 15. 所有策略持久化、动态因子、实时缓存、私有数据和自定义数据源必须写入 `rd` 的 `./mydb`，严禁自行创建 SQLite、MySQL、DuckDB 或其他第二套数据库。
+54: 16. `./data～./dataN` 是系统历史数据，`./mydb` 是私有写入空间。只能通过 `rd` 接口访问，不得绕过 SDK 直接操作底层文件。
+
+--- line 18 ---
+18:     get_last_tick,
+19:     get_fundamentals,
+20:     query,
+21:     cash_flow,
+22: )
+23: ```
+24: 
+25: 本地行情优先使用 `rd`。在线接口只用于本地数据库没有的数据，不能用在线接口暴力替代本地批量行情。
+26: 
+27: 
+28: 推荐方式是：
+29: 
+30: ```python
+31: from stock_sdk import *
+32: ```
+33: 
+34: 
+35: ---
+36: 
+37: ## 1. AI 必须遵守的规则
+38: 
+39: 1. `rd` 是分层 K-V 数据库，不是 SQL，也不是 REST 路由猜测器。先确定 `table + K1 + K2...`，再调用。
+40: 2. 日K和分钟K的固定模板是 `rd.get/vals("日k或分钟k", code, date_query)`，不能省略 `code` 或 `date_query`。
+41: 3. 禁止用 `rd.get("日k")`、`rd.get("日k", "all")`、`rd.get("日k", code)` 反复试错。
+42: 4. 字符串 `"all"` 不是通配符。整层匹配使用 `"*"`；前缀匹配使用 `"6*"`、`"202606*"`。
+43: 5. 精确读取单条值用 `rd.get()`；读取匹配结果中的值集合优先用 `rd.vals()`；只要完整键名用 `rd.keys()`。
+44: 6. `rd.vals(...).get("date,code,close")` 是服务端字段投影，不是 Python 端二次筛选。
+45: 7. 对查询对象先切片、再执行。`query[:100]`、`query[-100:]` 会进入请求参数；不要先全量下载再切片。
+46: 8. 大范围查询使用代码前缀，让服务器筛选，例如 `rd.vals("日k", "6*", date_query)`；不得循环五千个代码逐股请求。
+47: 9. 需要复权、周/月K或分钟聚合时使用 `rd.get_data()`，不要重新手写复权和周期合成。
+48: 10. Python 版 `zb.get()` 既支持股票代码，也支持 `rd.get_data(fields=None)` 的对象行；传入原始行情时直接计算，不得再次请求或二次复权。
+49: 11. 在线 `get_price/get_ticks/...` 默认按单标的小数据量使用。当前在线服务会限制批量代码请求。
+50: 12. 在线接口可能以 `{"error": "..."}` 返回业务错误，不一定抛异常；必须检查返回值。
+51: 13. 同一查询结果应缓存。界面排序、筛选、翻页和重绘不得重复拉取数据。
+52: 14. 股票代码始终使用字符串，例如 `'000001'`，不能写成整数 `1`。
+53: 15. 所有策略持久化、动态因子、实时缓存、私有数据和自定义数据源必须写入 `rd` 的 `./mydb`，严禁自行创建 SQLite、MySQL、DuckDB 或其他第二套数据库。
+54: 16. `./data～./dataN` 是系统历史数据，`./mydb` 是私有写入空间。只能通过 `rd` 接口访问，不得绕过 SDK 直接操作底层文件。
+55: 
+56: ---
+57: 
+
+--- line 49 ---
+49: 11. 在线 `get_price/get_ticks/...` 默认按单标的小数据量使用。当前在线服务会限制批量代码请求。
+50: 12. 在线接口可能以 `{"error": "..."}` 返回业务错误，不一定抛异常；必须检查返回值。
+51: 13. 同一查询结果应缓存。界面排序、筛选、翻页和重绘不得重复拉取数据。
+52: 14. 股票代码始终使用字符串，例如 `'000001'`，不能写成整数 `1`。
+53: 15. 所有策略持久化、动态因子、实时缓存、私有数据和自定义数据源必须写入 `rd` 的 `./mydb`，严禁自行创建 SQLite、MySQL、DuckDB 或其他第二套数据库。
+54: 16. `./data～./dataN` 是系统历史数据，`./mydb` 是私有写入空间。只能通过 `rd` 接口访问，不得绕过 SDK 直接操作底层文件。
+55: 
+56: ---
+57: 
+58: ## 2. 安装、导入和连接
+59: 
+60: ### 2.1 文件与运行环境
+61: 
+62: Python 调用所需文件：
+63: 
+64: - `stockdb.pyd`：Python 3.8+ 非自由线程版本。
+65: - `3.14t+stockdb.pyd`：Python 3.14t+ 自由线程版本，使用时按部署说明改名为 `stockdb.pyd`。
+66: - `stock_sdk.py`：成品 SDK。
+67: - `stockdb.exe`：本地数据库服务。
+68: 
+69: 本地使用时先更新并启动 `stockdb.exe`。默认地址是 `127.0.0.1:7899`。此步骤用户测完成数据更新和启动。
+70: 
+71: ### 2.2 推荐导入
+72: 
+73: ```python
+74: from stock_sdk import *
+75: ```
+76: 
+77: 需要修改本地数据库连接时：
+78: 
+79: ```python
+80: from stock_sdk import *
+81: 
+82: init(
+83:     host="127.0.0.1",
+84:     port=7899,
+85:     socket_timeout=None,
+86:     password=None,
+87:     warm=True,
+88: )
+
+--- line 1179 ---
+1179: 当前在线服务对批量代码有限制。实测 `get_price([code1, code2], ...)` 会返回批量限制错误，因此在线行情按单代码、小 `count` 使用。
+1180: 
+1181: 统一错误检查：
+1182: 
+1183: ```python
+1184: def require_online_result(value):
+1185:     if isinstance(value, dict) and value.get("error"):
+1186:         raise RuntimeError(value["error"])
+1187:     return value
+1188: ```
+1189: 
+1190: ### 12.2 get_price
+1191: 
+1192: 经过验证的单代码模板：
+1193: 
+1194: ```python
+1195: from stock_sdk import set_init, get_price
+1196: 
+1197: set_init(df=True)
+1198: 
+1199: df = require_online_result(get_price(
+1200:     "000001",
+1201:     end_date="2026-08-06",
+1202:     count=20,
+1203:     frequency="daily",
+1204:     fields=["open", "high", "low", "close", "volume", "money"],
+1205: ))
+1206: ```
+1207: 
+1208: `df=True` 时返回 `pandas.DataFrame`，日期保存在索引中。
+1209: 
+1210: `df=False/None` 时返回 `list[dict]`，`get_price` 的日期索引不会自动成为字典字段：
+1211: 
+1212: ```python
+1213: set_init(df=False)
+1214: rows = get_price(
+1215:     "000001",
+1216:     end_date="2026-08-06",
+1217:     count=2,
+1218:     frequency="daily",
+
+--- line 1190 ---
+1190: ### 12.2 get_price
+1191: 
+1192: 经过验证的单代码模板：
+1193: 
+1194: ```python
+1195: from stock_sdk import set_init, get_price
+1196: 
+1197: set_init(df=True)
+1198: 
+1199: df = require_online_result(get_price(
+1200:     "000001",
+1201:     end_date="2026-08-06",
+1202:     count=20,
+1203:     frequency="daily",
+1204:     fields=["open", "high", "low", "close", "volume", "money"],
+1205: ))
+1206: ```
+1207: 
+1208: `df=True` 时返回 `pandas.DataFrame`，日期保存在索引中。
+1209: 
+1210: `df=False/None` 时返回 `list[dict]`，`get_price` 的日期索引不会自动成为字典字段：
+1211: 
+1212: ```python
+1213: set_init(df=False)
+1214: rows = get_price(
+1215:     "000001",
+1216:     end_date="2026-08-06",
+1217:     count=2,
+1218:     frequency="daily",
+1219:     fields=["open", "close"],
+1220: )
+1221: # [{'open': 11.41, 'close': 11.25}, ...]
+1222: ```
+1223: 
+1224: 如果普通列表结果必须包含日期，优先使用 `get_bars(..., fields=['date', ...])`，或使用 `df=True` 后重置索引。
+1225: 
+1226: ### 12.3 get_bars
+1227: 
+1228: ```python
+1229: from stock_sdk import get_bars
+
+--- line 1195 ---
+1195: from stock_sdk import set_init, get_price
+1196: 
+1197: set_init(df=True)
+1198: 
+1199: df = require_online_result(get_price(
+1200:     "000001",
+1201:     end_date="2026-08-06",
+1202:     count=20,
+1203:     frequency="daily",
+1204:     fields=["open", "high", "low", "close", "volume", "money"],
+1205: ))
+1206: ```
+1207: 
+1208: `df=True` 时返回 `pandas.DataFrame`，日期保存在索引中。
+1209: 
+1210: `df=False/None` 时返回 `list[dict]`，`get_price` 的日期索引不会自动成为字典字段：
+1211: 
+1212: ```python
+1213: set_init(df=False)
+1214: rows = get_price(
+1215:     "000001",
+1216:     end_date="2026-08-06",
+1217:     count=2,
+1218:     frequency="daily",
+1219:     fields=["open", "close"],
+1220: )
+1221: # [{'open': 11.41, 'close': 11.25}, ...]
+1222: ```
+1223: 
+1224: 如果普通列表结果必须包含日期，优先使用 `get_bars(..., fields=['date', ...])`，或使用 `df=True` 后重置索引。
+1225: 
+1226: ### 12.3 get_bars
+1227: 
+1228: ```python
+1229: from stock_sdk import get_bars
+1230: 
+1231: rows = require_online_result(get_bars(
+1232:     "000001",
+1233:     count=20,
+1234:     unit="1d",
+
+--- line 1199 ---
+1199: df = require_online_result(get_price(
+1200:     "000001",
+1201:     end_date="2026-08-06",
+1202:     count=20,
+1203:     frequency="daily",
+1204:     fields=["open", "high", "low", "close", "volume", "money"],
+1205: ))
+1206: ```
+1207: 
+1208: `df=True` 时返回 `pandas.DataFrame`，日期保存在索引中。
+1209: 
+1210: `df=False/None` 时返回 `list[dict]`，`get_price` 的日期索引不会自动成为字典字段：
+1211: 
+1212: ```python
+1213: set_init(df=False)
+1214: rows = get_price(
+1215:     "000001",
+1216:     end_date="2026-08-06",
+1217:     count=2,
+1218:     frequency="daily",
+1219:     fields=["open", "close"],
+1220: )
+1221: # [{'open': 11.41, 'close': 11.25}, ...]
+1222: ```
+1223: 
+1224: 如果普通列表结果必须包含日期，优先使用 `get_bars(..., fields=['date', ...])`，或使用 `df=True` 后重置索引。
+1225: 
+1226: ### 12.3 get_bars
+1227: 
+1228: ```python
+1229: from stock_sdk import get_bars
+1230: 
+1231: rows = require_online_result(get_bars(
+1232:     "000001",
+1233:     count=20,
+1234:     unit="1d",
+1235:     fields=["date", "open", "high", "low", "close", "volume"],
+1236:     end_dt="2026-08-06",
+1237: ))
+1238: ```
+
+--- line 1210 ---
+1210: `df=False/None` 时返回 `list[dict]`，`get_price` 的日期索引不会自动成为字典字段：
+1211: 
+1212: ```python
+1213: set_init(df=False)
+1214: rows = get_price(
+1215:     "000001",
+1216:     end_date="2026-08-06",
+1217:     count=2,
+1218:     frequency="daily",
+1219:     fields=["open", "close"],
+1220: )
+1221: # [{'open': 11.41, 'close': 11.25}, ...]
+1222: ```
+1223: 
+1224: 如果普通列表结果必须包含日期，优先使用 `get_bars(..., fields=['date', ...])`，或使用 `df=True` 后重置索引。
+1225: 
+1226: ### 12.3 get_bars
+1227: 
+1228: ```python
+1229: from stock_sdk import get_bars
+1230: 
+1231: rows = require_online_result(get_bars(
+1232:     "000001",
+1233:     count=20,
+1234:     unit="1d",
+1235:     fields=["date", "open", "high", "low", "close", "volume"],
+1236:     end_dt="2026-08-06",
+1237: ))
+1238: ```
+1239: 
+1240: 普通返回示例：
+1241: 
+1242: ```python
+1243: [
+1244:     {'date': '2026-08-05', 'open': 11.41, 'close': 11.25},
+1245:     ...
+1246: ]
+1247: ```
+1248: 
+1249: ### 12.4 get_ticks / get_last_tick
+
+--- line 1214 ---
+1214: rows = get_price(
+1215:     "000001",
+1216:     end_date="2026-08-06",
+1217:     count=2,
+1218:     frequency="daily",
+1219:     fields=["open", "close"],
+1220: )
+1221: # [{'open': 11.41, 'close': 11.25}, ...]
+1222: ```
+1223: 
+1224: 如果普通列表结果必须包含日期，优先使用 `get_bars(..., fields=['date', ...])`，或使用 `df=True` 后重置索引。
+1225: 
+1226: ### 12.3 get_bars
+1227: 
+1228: ```python
+1229: from stock_sdk import get_bars
+1230: 
+1231: rows = require_online_result(get_bars(
+1232:     "000001",
+1233:     count=20,
+1234:     unit="1d",
+1235:     fields=["date", "open", "high", "low", "close", "volume"],
+1236:     end_dt="2026-08-06",
+1237: ))
+1238: ```
+1239: 
+1240: 普通返回示例：
+1241: 
+1242: ```python
+1243: [
+1244:     {'date': '2026-08-05', 'open': 11.41, 'close': 11.25},
+1245:     ...
+1246: ]
+1247: ```
+1248: 
+1249: ### 12.4 get_ticks / get_last_tick
+1250: 
+1251: 历史 Tick 小样本：
+1252: 
+1253: ```python
+
+--- line 1249 ---
+1249: ### 12.4 get_ticks / get_last_tick
+1250: 
+1251: 历史 Tick 小样本：
+1252: 
+1253: ```python
+1254: from stock_sdk import get_ticks
+1255: 
+1256: ticks = require_online_result(get_ticks(
+1257:     "000001",
+1258:     end_dt="2026-08-06 15:00:00",
+1259:     count=20,
+1260:     fields=["time", "current", "volume"],
+1261: ))
+1262: ```
+1263: 
+1264: 最新 Tick：
+1265: 
+1266: ```python
+1267: from stock_sdk import get_last_tick
+1268: 
+1269: ticks = require_online_result(get_last_tick("000001", count=10))
+1270: ```
+1271: 
+1272: 常见返回字段：
+1273: 
+1274: ```text
+1275: time,current,high,low,volume,money
+1276: ```
+1277: 
+1278: `time` 在普通列表模式下可能是 `20260807152700.0` 形式的数字，使用前按14位日期时间规范化。
+1279: 
+1280: ### 12.5 交易日和证券信息
+1281: 
+1282: ```python
+1283: from stock_sdk import (
+1284:     set_init,
+1285:     get_trade_days,
+1286:     get_all_securities,
+1287:     get_security_info,
+1288: )
+
+--- line 1267 ---
+1267: from stock_sdk import get_last_tick
+1268: 
+1269: ticks = require_online_result(get_last_tick("000001", count=10))
+1270: ```
+1271: 
+1272: 常见返回字段：
+1273: 
+1274: ```text
+1275: time,current,high,low,volume,money
+1276: ```
+1277: 
+1278: `time` 在普通列表模式下可能是 `20260807152700.0` 形式的数字，使用前按14位日期时间规范化。
+1279: 
+1280: ### 12.5 交易日和证券信息
+1281: 
+1282: ```python
+1283: from stock_sdk import (
+1284:     set_init,
+1285:     get_trade_days,
+1286:     get_all_securities,
+1287:     get_security_info,
+1288: )
+1289: 
+1290: days = require_online_result(get_trade_days(
+1291:     end_date="2026-08-06",
+1292:     count=20,
+1293: ))
+1294: 
+1295: info = require_online_result(get_security_info("000001"))
+1296: 
+1297: set_init(df=True)
+1298: stocks = require_online_result(get_all_securities(
+1299:     types=["stock"],
+1300:     date="2026-08-06",
+1301: ))
+1302: ```
+1303: 
+1304: `get_all_securities(..., df=True)` 的股票代码位于 DataFrame 索引；普通列表模式会丢失该索引，不适合直接建立代码映射。
+1305: 
+1306: ### 12.6 财务数据
+
+--- line 1269 ---
+1269: ticks = require_online_result(get_last_tick("000001", count=10))
+1270: ```
+1271: 
+1272: 常见返回字段：
+1273: 
+1274: ```text
+1275: time,current,high,low,volume,money
+1276: ```
+1277: 
+1278: `time` 在普通列表模式下可能是 `20260807152700.0` 形式的数字，使用前按14位日期时间规范化。
+1279: 
+1280: ### 12.5 交易日和证券信息
+1281: 
+1282: ```python
+1283: from stock_sdk import (
+1284:     set_init,
+1285:     get_trade_days,
+1286:     get_all_securities,
+1287:     get_security_info,
+1288: )
+1289: 
+1290: days = require_online_result(get_trade_days(
+1291:     end_date="2026-08-06",
+1292:     count=20,
+1293: ))
+1294: 
+1295: info = require_online_result(get_security_info("000001"))
+1296: 
+1297: set_init(df=True)
+1298: stocks = require_online_result(get_all_securities(
+1299:     types=["stock"],
+1300:     date="2026-08-06",
+1301: ))
+1302: ```
+1303: 
+1304: `get_all_securities(..., df=True)` 的股票代码位于 DataFrame 索引；普通列表模式会丢失该索引，不适合直接建立代码映射。
+1305: 
+1306: ### 12.6 财务数据
+1307: 
+1308: ```python
+
+--- line 1338 ---
+1338: get_price, get_bars, get_call_auction, get_ticks, get_last_tick,
+1339: get_extras, get_money_flow, get_mtss,
+1340: get_margincash_stocks, get_marginsec_stocks
+1341: ```
+1342: 
+1343: 财务、因子与衍生品：
+1344: 
+1345: ```text
+1346: get_fundamentals, get_fundamentals_continuously,
+1347: get_fund_info, get_valuation,
+1348: get_billboard_list, get_locked_shares,
+1349: get_factor_values, get_factor_kanban_values,
+1350: get_index_style_exposure,
+1351: get_dominant_future, get_future_contracts
+1352: ```
+1353: 
+1354: 这些接口由在线 `RemoteProxy` 提供，Python 无法可靠地通过 `inspect.signature()` 取得完整签名。AI 不得对未使用的接口进行几十次参数试探；只有策略明确需要时，按已有示例或部署方接口说明构造一次小查询。
+1355: 
+1356: ---
+1357: 
+1358: ## 13. 完整纯 Python 策略流水线
+1359: 
+1360: ### 13.1 少量股票：get_data + zb + bk
+1361: 
+1362: ```python
+1363: from stock_sdk import rd, bk, zb
+1364: 
+1365: CODES = ["600633", "600422", "000001"]
+1366: START = "20260701"
+1367: END = "20260807"
+1368: 
+1369: # 1. 一次批量加载行情
+1370: rows_by_code = rd.get_data(
+1371:     CODES,
+1372:     start=START,
+1373:     end=END,
+1374:     frequency="1d",
+1375:     fq="qfq",
+1376: )
+1377: 
+
+--- line 1612 ---
+1612: ### 错误：在线 get_price 批量代码
+1613: 
+1614: ```python
+1615: get_price(["000001", "600633"], ...)
+1616: ```
+1617: 
+1618: 当前在线服务限制批量行情。历史批量使用本地 `rd`；在线按单代码、小 `count` 调用。
+1619: 
+1620: ### 错误：不检查在线错误字典
+1621: 
+1622: ```python
+1623: rows = get_price(...)
+1624: ```
+1625: 
+1626: 必须检查：
+1627: 
+1628: ```python
+1629: rows = require_online_result(get_price(...))
+1630: ```
+1631: 
+1632: ---
+1633: 
+1634: ## 16. 给 AI 的 Python 策略需求模板
+1635: 
+1636: ```text
+1637: 使用 Python stock_sdk 开发策略或策略界面。
+1638: 
+1639: 运行方式：本地 stockdb.exe / 部署方远程体验
+1640: 证券范围：指定代码 / A股 / 自定义前缀 / 某个板块
+1641: 日期范围：YYYYMMDD 到 YYYYMMDD，或结束使用 N
+1642: 周期：1d / 1m / 5m / 15m / 30m / 60m / 1w / 1M
+1643: 复权：qfq / hfq / None
+1644: 指标：例如 MACD、KDJ、MA、cross
+1645: 在线补充：是否需要 get_price、tick、财务、指数成分
+1646: 私有存储：需要保存的配置、因子、缓存、策略状态及table/key结构
+1647: 输出：普通Python结构 / pandas DataFrame
+1648: 界面：PySide6 / Tkinter / Streamlit / 其他指定框架
+1649: 
+1650: 硬性要求：
+1651: 1. 严格按 table + key1 + key2 的KV模板调用rd。
+
+--- line 1615 ---
+1615: get_price(["000001", "600633"], ...)
+1616: ```
+1617: 
+1618: 当前在线服务限制批量行情。历史批量使用本地 `rd`；在线按单代码、小 `count` 调用。
+1619: 
+1620: ### 错误：不检查在线错误字典
+1621: 
+1622: ```python
+1623: rows = get_price(...)
+1624: ```
+1625: 
+1626: 必须检查：
+1627: 
+1628: ```python
+1629: rows = require_online_result(get_price(...))
+1630: ```
+1631: 
+1632: ---
+1633: 
+1634: ## 16. 给 AI 的 Python 策略需求模板
+1635: 
+1636: ```text
+1637: 使用 Python stock_sdk 开发策略或策略界面。
+1638: 
+1639: 运行方式：本地 stockdb.exe / 部署方远程体验
+1640: 证券范围：指定代码 / A股 / 自定义前缀 / 某个板块
+1641: 日期范围：YYYYMMDD 到 YYYYMMDD，或结束使用 N
+1642: 周期：1d / 1m / 5m / 15m / 30m / 60m / 1w / 1M
+1643: 复权：qfq / hfq / None
+1644: 指标：例如 MACD、KDJ、MA、cross
+1645: 在线补充：是否需要 get_price、tick、财务、指数成分
+1646: 私有存储：需要保存的配置、因子、缓存、策略状态及table/key结构
+1647: 输出：普通Python结构 / pandas DataFrame
+1648: 界面：PySide6 / Tkinter / Streamlit / 其他指定框架
+1649: 
+1650: 硬性要求：
+1651: 1. 严格按 table + key1 + key2 的KV模板调用rd。
+1652: 2. 不得使用 rd.get("日k")、rd.get("日k", "all") 等试错调用。
+1653: 3. 大范围原始行情使用代码前缀服务端查询，不逐股请求。
+1654: 4. 复权和周期加工使用 rd.get_data，不重复实现。
+
+--- line 1623 ---
+1623: rows = get_price(...)
+1624: ```
+1625: 
+1626: 必须检查：
+1627: 
+1628: ```python
+1629: rows = require_online_result(get_price(...))
+1630: ```
+1631: 
+1632: ---
+1633: 
+1634: ## 16. 给 AI 的 Python 策略需求模板
+1635: 
+1636: ```text
+1637: 使用 Python stock_sdk 开发策略或策略界面。
+1638: 
+1639: 运行方式：本地 stockdb.exe / 部署方远程体验
+1640: 证券范围：指定代码 / A股 / 自定义前缀 / 某个板块
+1641: 日期范围：YYYYMMDD 到 YYYYMMDD，或结束使用 N
+1642: 周期：1d / 1m / 5m / 15m / 30m / 60m / 1w / 1M
+1643: 复权：qfq / hfq / None
+1644: 指标：例如 MACD、KDJ、MA、cross
+1645: 在线补充：是否需要 get_price、tick、财务、指数成分
+1646: 私有存储：需要保存的配置、因子、缓存、策略状态及table/key结构
+1647: 输出：普通Python结构 / pandas DataFrame
+1648: 界面：PySide6 / Tkinter / Streamlit / 其他指定框架
+1649: 
+1650: 硬性要求：
+1651: 1. 严格按 table + key1 + key2 的KV模板调用rd。
+1652: 2. 不得使用 rd.get("日k")、rd.get("日k", "all") 等试错调用。
+1653: 3. 大范围原始行情使用代码前缀服务端查询，不逐股请求。
+1654: 4. 复权和周期加工使用 rd.get_data，不重复实现。
+1655: 5. Python版 zb.get 可传代码，也可直接传 fields=None 的对象行情；已有行情时必须复用，不能重复拉取。
+1656: 6. 在线行情只允许单代码、小数据量，并检查 error 字典。
+1657: 7. 查询、指标和在线结果全部缓存，界面重绘不得重新请求。
+1658: 8. 所有持久化数据只能使用rd的./mydb；严禁SQLite、MySQL、DuckDB等其他数据库。
+1659: 9. 批量写入必须使用rd.pipe()+mset，批量读取必须使用表达式、字段投影和服务端切片。
+1660: 10. 直接给出可运行的纯Python代码。
+1661: ```
+1662: 
+
+--- line 1629 ---
+1629: rows = require_online_result(get_price(...))
+1630: ```
+1631: 
+1632: ---
+1633: 
+1634: ## 16. 给 AI 的 Python 策略需求模板
+1635: 
+1636: ```text
+1637: 使用 Python stock_sdk 开发策略或策略界面。
+1638: 
+1639: 运行方式：本地 stockdb.exe / 部署方远程体验
+1640: 证券范围：指定代码 / A股 / 自定义前缀 / 某个板块
+1641: 日期范围：YYYYMMDD 到 YYYYMMDD，或结束使用 N
+1642: 周期：1d / 1m / 5m / 15m / 30m / 60m / 1w / 1M
+1643: 复权：qfq / hfq / None
+1644: 指标：例如 MACD、KDJ、MA、cross
+1645: 在线补充：是否需要 get_price、tick、财务、指数成分
+1646: 私有存储：需要保存的配置、因子、缓存、策略状态及table/key结构
+1647: 输出：普通Python结构 / pandas DataFrame
+1648: 界面：PySide6 / Tkinter / Streamlit / 其他指定框架
+1649: 
+1650: 硬性要求：
+1651: 1. 严格按 table + key1 + key2 的KV模板调用rd。
+1652: 2. 不得使用 rd.get("日k")、rd.get("日k", "all") 等试错调用。
+1653: 3. 大范围原始行情使用代码前缀服务端查询，不逐股请求。
+1654: 4. 复权和周期加工使用 rd.get_data，不重复实现。
+1655: 5. Python版 zb.get 可传代码，也可直接传 fields=None 的对象行情；已有行情时必须复用，不能重复拉取。
+1656: 6. 在线行情只允许单代码、小数据量，并检查 error 字典。
+1657: 7. 查询、指标和在线结果全部缓存，界面重绘不得重新请求。
+1658: 8. 所有持久化数据只能使用rd的./mydb；严禁SQLite、MySQL、DuckDB等其他数据库。
+1659: 9. 批量写入必须使用rd.pipe()+mset，批量读取必须使用表达式、字段投影和服务端切片。
+1660: 10. 直接给出可运行的纯Python代码。
+1661: ```
+1662: 
+1663: 当需求存在歧义时，优先明确：
+1664: 
+1665: - “全市场”是否包含基金、债券、北交所和其他9开头证券？
+1666: - 需要原始行情还是前/后复权行情？
+1667: - N日收益是N根K线还是N个完整收益区间？
+1668: - 在线数据是否确实无法从本地 `rd` 获得？
+
+--- line 1645 ---
+1645: 在线补充：是否需要 get_price、tick、财务、指数成分
+1646: 私有存储：需要保存的配置、因子、缓存、策略状态及table/key结构
+1647: 输出：普通Python结构 / pandas DataFrame
+1648: 界面：PySide6 / Tkinter / Streamlit / 其他指定框架
+1649: 
+1650: 硬性要求：
+1651: 1. 严格按 table + key1 + key2 的KV模板调用rd。
+1652: 2. 不得使用 rd.get("日k")、rd.get("日k", "all") 等试错调用。
+1653: 3. 大范围原始行情使用代码前缀服务端查询，不逐股请求。
+1654: 4. 复权和周期加工使用 rd.get_data，不重复实现。
+1655: 5. Python版 zb.get 可传代码，也可直接传 fields=None 的对象行情；已有行情时必须复用，不能重复拉取。
+1656: 6. 在线行情只允许单代码、小数据量，并检查 error 字典。
+1657: 7. 查询、指标和在线结果全部缓存，界面重绘不得重新请求。
+1658: 8. 所有持久化数据只能使用rd的./mydb；严禁SQLite、MySQL、DuckDB等其他数据库。
+1659: 9. 批量写入必须使用rd.pipe()+mset，批量读取必须使用表达式、字段投影和服务端切片。
+1660: 10. 直接给出可运行的纯Python代码。
+1661: ```
+1662: 
+1663: 当需求存在歧义时，优先明确：
+1664: 
+1665: - “全市场”是否包含基金、债券、北交所和其他9开头证券？
+1666: - 需要原始行情还是前/后复权行情？
+1667: - N日收益是N根K线还是N个完整收益区间？
+1668: - 在线数据是否确实无法从本地 `rd` 获得？
+1669: - 普通列表还是 DataFrame，是否必须保留日期索引？
+1670: - 界面使用哪个 Python 框架？
+1671: 
+1672: 用户已经明确时，不要重复询问，不要通过大量无效调用探索接口。
