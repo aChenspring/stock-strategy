@@ -167,14 +167,17 @@ class BacktestPage(QWidget):
         self.ed_start.setPlaceholderText("留空=最近120交易日")
         self.ed_end = QLineEdit("")
         self.ed_end.setPlaceholderText("留空=最新交易日")
-        self.ed_cash = QLineEdit("1000000")
-        self.ed_topn = QLineEdit("20")
-        self.ed_hold = QLineEdit("10")
+        self.ed_cash = QLineEdit("6000")
+        self.ed_topn = QLineEdit("10")
+        self.ed_topn.setToolTip(
+            "持仓数随本金自适应：每只至少约 600 元预算（≈1 手低价股），\n"
+            "6000 元本金实际最多约 10 只；加大本金可自动放宽上限。")
+        self.ed_hold = QLineEdit("15")
         self.ed_fee = QLineEdit("0.0005")
-        self.ed_minscore = QLineEdit("65")
+        self.ed_minscore = QLineEdit("55")
         self.ed_stop = QLineEdit("-12")
         self.ed_profit = QLineEdit("20")
-        self.ed_rebal = QLineEdit("3")
+        self.ed_rebal = QLineEdit("2")
         self.cb_universe = QComboBox()
         # 默认全A：每个历史交易日站在当日视角重新打分选股，避免拿当前选股套历史（前视偏差）
         self.cb_universe.addItem("全A（抽样）·逐日历史选股", "all")
@@ -387,12 +390,15 @@ class BacktestPage(QWidget):
             "min_score": _f(self.ed_minscore, DEFAULT_BT_CONFIG["min_score"]),
             "stop_loss": _f(self.ed_stop, DEFAULT_BT_CONFIG["stop_loss"]),
             "take_profit": _f(self.ed_profit, DEFAULT_BT_CONFIG["take_profit"]),
-            "rebalance_every": max(1, int(_f(self.ed_rebal, 1))),
+            "rebalance_every": max(1, int(_f(self.ed_rebal, DEFAULT_BT_CONFIG["rebalance_every"]))),
             "universe": self.cb_universe.currentData(),
             "max_codes": int(_f(self.ed_maxcodes, 400)),
             "market_filter": self.chk_market.isChecked(),
-            "max_buy_pct": (lambda v: v if v and v > 0 else None)(
-                _f(self.ed_maxbuy, 6.0)),
+            "market_filter_mode": "strong",   # 指数>20日线 且 20日线走多
+            "ma_up_days": 3,
+            "max_buy_pct": (lambda s: None if not s.strip() else
+                            (_f(self.ed_maxbuy, DEFAULT_BT_CONFIG["max_buy_pct"]) or None))(
+                self.ed_maxbuy.text()),
             "hits_codes": self._hits_codes,
             # 优先取策略管理页未保存的编辑态；无 provider 时回退已保存配置
             "config": (self.strategy_provider() if self.strategy_provider

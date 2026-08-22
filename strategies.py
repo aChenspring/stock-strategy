@@ -18,8 +18,33 @@ def _get(row: Optional[dict], field: str) -> Optional[float]:
     return _finite(row.get(field))
 
 
-def _calc_indicators_from_rows(valid: List[dict]) -> Dict[str, Any]:
-    """从有效K线行计算简单技术指标（不依赖zb，供策略硬条件使用）"""
+def _calc_indicators_from_rows(valid: List[dict],
+                               external: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """从有效K线行计算简单技术指标（不依赖zb，供策略硬条件使用）。
+    external 可传入 compute_indicators 产出的指标（含 ma*/macd/rsi6），
+    命中时跳过最耗时的 ema/MACD/RSI 重算，仅补算轻量的高低点/量能键（扫描提速）。"""
+    ext = external or {}
+    if ext.get("ma5") is not None and all(k in ext for k in
+            ("ma10", "ma20", "ma60", "macd", "rsi6")):
+        closes = [_get(r, "close") or 0 for r in valid]
+        highs = [_get(r, "high") or 0 for r in valid]
+        lows = [_get(r, "low") or 0 for r in valid]
+        vols = [_get(r, "volume") or 0 for r in valid]
+        n = len(closes)
+        return {
+            "close": closes[-1] if closes else None,
+            "ma5": ext["ma5"],
+            "ma10": ext["ma10"],
+            "ma20": ext["ma20"],
+            "ma60": ext["ma60"],
+            "high20": max(highs[-20:]) if n >= 20 else (max(highs) if highs else None),
+            "high60": max(highs[-60:]) if n >= 60 else (max(highs) if highs else None),
+            "low60": min(lows[-60:]) if n >= 60 else (min(lows) if lows else None),
+            "vol_avg5": (sum(vols[-5:]) / 5) if n >= 5 else None,
+            "vol": vols[-1] if vols else None,
+            "macd": ext["macd"],
+            "rsi6": ext["rsi6"],
+        }
     closes = [_get(r, "close") or 0 for r in valid]
     highs = [_get(r, "high") or 0 for r in valid]
     lows = [_get(r, "low") or 0 for r in valid]
@@ -553,9 +578,29 @@ def _check_attack(calc: Dict[str, Any], valid: List[dict], online: Dict[str, Any
 
 
 # ============ 策略注册表 ============
+# 综合因子策略：无硬条件，命中由「综合因子分 >= min_score」判定（扫描端应用）。
+# min_score=55 为参数挖掘得到的最优门槛，与回测 DEFAULT_BT_CONFIG["min_score"] 保持一致。
+FACTOR_DEFAULT_MIN_SCORE = 55.0
+
+
+def _check_factor_default(calc: dict, valid: List[dict], online: Dict[str, Any]) -> bool:
+    """综合因子策略无硬条件筛选：命中由综合分门槛决定，此处恒为 True。"""
+    return True
+
+
 def get_strategies() -> List[Dict[str, Any]]:
-    """返回所有 v9 策略定义"""
+    """返回所有扫描策略定义：factor_default 综合因子策略 + v9 硬条件策略。
+
+    含 ``min_score`` 的策略（综合因子）由调用方按综合分门槛判定命中，
+    其余策略按 ``check`` 硬条件判定。"""
     return [
+        {
+            "key": "factor_default",
+            "name": "综合因子策略",
+            "desc": "14因子加权综合分≥55（回测挖掘最优门槛，可在策略页迭代编辑因子与权重）",
+            "check": _check_factor_default,
+            "min_score": FACTOR_DEFAULT_MIN_SCORE,
+        },
         {
             "key": "v9Core",
             "name": "v9Core 传统成长",
@@ -639,14 +684,11 @@ def get_strategies() -> List[Dict[str, Any]]:
 
 def check_strategy(strategy_key: str, valid: List[dict], online: Dict[str, Any],
                    indicators: Optional[Dict[str, Any]] = None) -> bool:
-    """检查某策略是否命中某股票；可选传入 compute_indicators 产出的外部指标"""
+    """检查某策略是否命中某股票；可选传入 compute_indicators 产出的外部指标，
+    命中时内部复用其 ma*/macd/rsi6，避免重复重算。"""
     for s in get_strategies():
         if s["key"] == strategy_key:
-            calc = _calc_indicators_from_rows(valid)
-            if indicators:
-                for k in ("macd", "rsi6", "ma20", "ma60", "close"):
-                    if k in indicators:
-                        calc[k] = indicators[k]
+            calc = _calc_indicators_from_rows(valid, indicators)
             try:
                 return bool(s["check"](calc, valid, online))
             except Exception:
@@ -654,9 +696,10 @@ def check_strategy(strategy_key: str, valid: List[dict], online: Dict[str, Any],
     return False
 
 
-def risk_warnings(valid: List[dict], online: Dict[str, Any]) -> List[str]:
-    """返回风控提示"""
-    calc = _calc_indicators_from_rows(valid)
+def risk_warnings(valid: List[dict], online: Dict[str, Any],
+                  indicators: Optional[Dict[str, Any]] = None) -> List[str]:
+    """返回风控提示；indicators 可传外部指标以跳过重复重算"""
+    calc = _calc_indicators_from_rows(valid, indicators)
     try:
         return _check_risk(calc, valid, online)
     except Exception:

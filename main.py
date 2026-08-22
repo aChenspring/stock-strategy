@@ -309,6 +309,11 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
+            # 预解析策略定义：综合因子策略按 min_score 门槛判定命中，v9 策略按 check 硬条件
+            self._strategy_min_score = next(
+                (s.get("min_score") for s in get_strategies()
+                 if s["key"] == self.strategy_key), None)
+
             self.progress.emit(2, "加载行情数据...")
             rows_by_code = load_market_rows(PREFIXES, START, END)
             self.progress.emit(10, f"行情加载完成，共{len(rows_by_code)}只股票")
@@ -339,8 +344,32 @@ class ScanWorker(QThread):
             board_env = compute_board_env(candidates, board_info_map)
             market_env = compute_market_env(candidates)
 
+            # 策略迭代：因子定义按当前配置预构建一次（粗排与线程池内只读复用）
+            fdefs = build_factor_defs(self.strategy_config)
+
+            # 粗排：本地因子快速打分，仅取前 candidate_limit 只进入在线精筛。
+            # 在线查询（财务/估值/资金流）是最耗时环节，粗排可砍掉约 90% 的在线请求，
+            # 是 3000+ 只全量扫描 3 小时 → 十几分钟的关键（默认候选池上限 300）。
+            if self.candidate_limit and len(candidates) > self.candidate_limit:
+                self.progress.emit(32, f"本地因子粗排 {len(candidates)} 只，取前 {self.candidate_limit} 只精筛...")
+
+                def _rough(code):
+                    if self._stop:
+                        return code, -1.0
+                    ind = indicators.get(code, {})
+                    sc = score_stock(code, candidates[code], ind,
+                                     board_env.get(code, 0), market_env, {},
+                                     config=self.strategy_config, factor_defs=fdefs)
+                    return code, (sc.get("score", 0.0) if sc else -1.0)
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    rough = dict(pool.map(_rough, candidates))
+                top = sorted(rough, key=lambda c: rough[c], reverse=True)[:self.candidate_limit]
+                candidates = {c: candidates[c] for c in top}
+                self.progress.emit(35, f"粗排后精筛候选池 {len(candidates)} 只")
+
             # 批量加载在线财务数据（接口不可用时快速跳过）
-            self.progress.emit(33, "加载在线财务数据...")
+            self.progress.emit(36, "加载在线财务数据...")
             cache = MarketCache()
             online_data = OnlineData(cache)
             online_data.fundamentals_batch(list(candidates.keys()), batch=100)
@@ -348,12 +377,14 @@ class ScanWorker(QThread):
             # 注意 date 必须与接口缓存键一致：valuation->latest, money_flow(days=5)->"5"
             online_data.prewarm([("val", "latest"), ("flow", "5")],
                                 list(candidates.keys()))
+            # 在线可用性探测：在线接口返回空列表不触发熔断，会导致每只都空转请求。
+            # 采样全部为空时本次扫描内短路在线请求（评分循环直接内存返回 None）。
+            if not online_data.probe_online(list(candidates.keys())):
+                self.progress.emit(37, "在线数据不可用，已切换纯本地因子评分（结果不受影响）")
 
             total = len(candidates)
             results = []
             passed_count = 0
-            # 策略迭代：因子定义按当前配置预构建一次（线程池内只读复用）
-            fdefs = build_factor_defs(self.strategy_config)
 
             def process(code):
                 """单只股票评分（线程池并行执行）"""
@@ -374,13 +405,18 @@ class ScanWorker(QThread):
                 scored = score_stock(code, valid, ind, board_score, market_env, online,
                                      config=self.strategy_config, factor_defs=fdefs)
 
-                # 命中判定：指标过滤 + 在线过滤 + 策略命中
+                # 命中判定：指标过滤 + 在线过滤 + 策略命中。
+                # 综合因子策略（factor_default）按综合分门槛命中，v9 策略按 check 硬条件命中。
+                if self._strategy_min_score is not None:
+                    strat_hit = scored["total"] >= self._strategy_min_score
+                else:
+                    strat_hit = check_strategy(self.strategy_key, valid, online, indicators=ind)
                 ok = (
                     self._passes_indicator_filters(code, ind, valid)
                     and self._passes_online_filters(code, valid, online, ind)
-                    and check_strategy(self.strategy_key, valid, online, indicators=ind)
+                    and strat_hit
                 )
-                warnings = risk_warnings(valid, online)
+                warnings = risk_warnings(valid, online, indicators=ind)
 
                 # ---- 组装完整展示字段（查询日近5日口径） ----
                 return self._build_result(code, valid, ind, online, scored, board_score, warnings,

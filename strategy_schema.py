@@ -364,14 +364,20 @@ def score_factor(fdef: Dict[str, Any], ctx: Dict[str, Any],
 
 def score_factor_set(factor_defs: List[dict], ctx: Dict[str, Any],
                      rules_map: Optional[Dict[str, List[dict]]] = None,
-                     active_sources: Optional[set] = None) -> Dict[str, float]:
-    """按配置计算全部复合因子分。active_sources 用于回测只算本地因子。"""
+                     active_sources: Optional[set] = None,
+                     online_empty: bool = False) -> Dict[str, float]:
+    """按配置计算全部复合因子分。active_sources 用于回测只算本地因子；
+    online_empty 为 True（在线数据整体不可用）时，在线/实时因子给中性分
+    （默认 5 分），避免 0 分稀释综合分导致小资金 min_score 门槛下漏选。"""
     rmap = rules_map if rules_map is not None else default_rules()
     scores = {}
     for f in factor_defs:
         src = f.get("source")
         if active_sources is not None and src not in active_sources:
             scores[f["key"]] = 0.0
+            continue
+        if online_empty and src in (SRC_ONLINE, SRC_REALTIME):
+            scores[f["key"]] = f.get("neutral", 0.5) * 10.0
             continue
         scores[f["key"]] = score_factor(f, ctx, rmap.get(f["key"]))
     return scores

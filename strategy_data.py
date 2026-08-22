@@ -195,6 +195,7 @@ class OnlineData:
         self.cache = cache
         self._mem = {}
         self._fail_streak = 0
+        self._online_dead = False  # 在线数据整体不可用（返回空），本次扫描内短路请求
         self._lock = threading.Lock()
 
     # 在线接口失败熔断：连续失败 FAIL_LIMIT 次后，本次扫描内直接跳过在线请求，
@@ -204,6 +205,30 @@ class OnlineData:
     def _circuit_open(self) -> bool:
         with self._lock:
             return self._fail_streak >= self.FAIL_LIMIT
+
+    def _available(self) -> bool:
+        """在线请求是否可用：熔断未打开 且 未标记在线整体空数据。"""
+        with self._lock:
+            return not (self._fail_streak >= self.FAIL_LIMIT or self._online_dead)
+
+    def probe_online(self, codes: List[str], max_samples: int = 2) -> bool:
+        """采样探测在线数据是否整体可用。
+
+        在线接口返回空列表（而非异常）时熔断不会触发，会导致每只股票都
+        白白发起在线请求。本方法抽查少量股票的估值/资金流：若全部无数据，
+        标记 ``_online_dead`` 短路本次扫描内的所有在线请求（切换纯本地评分）。
+        返回 True 表示在线可用（至少一只股票有任一在线数据）。"""
+        if self._online_dead or self._circuit_open():
+            return False
+        for code in codes[:max_samples]:
+            try:
+                if self.valuation(code) or self.money_flow(code, days=5):
+                    return True
+            except Exception:
+                pass
+        with self._lock:
+            self._online_dead = True
+        return False
 
     def _mark_ok(self):
         with self._lock:
@@ -267,7 +292,7 @@ class OnlineData:
 
     def fundamentals(self, code: str, stat_date: str = "") -> Optional[dict]:
         """财务数据：ROE/负债/净利增速/营收增速/经营现金流/股息率等"""
-        if self._circuit_open():
+        if not self._available():
             return None
         cached = self._get_cached("fund", code, stat_date or "latest")
         if cached:
@@ -296,7 +321,7 @@ class OnlineData:
         查询结果写入内存缓存，后续 ``fundamentals(code)`` 直接命中。
         接口不可用（熔断/异常）时静默跳过，不影响本地扫描。
         """
-        if not codes or self._circuit_open():
+        if not codes or not self._available():
             return {}
         out: Dict[str, dict] = {}
         codes = [c for c in codes if not self._get_cached("fund", c, stat_date or "latest")]
@@ -339,7 +364,7 @@ class OnlineData:
 
     def valuation(self, code: str, date: str = "") -> Optional[dict]:
         """估值数据：PE/PB/PS/市值"""
-        if self._circuit_open():
+        if not self._available():
             return None
         cached = self._get_cached("val", code, date or "latest")
         if cached:
@@ -368,7 +393,7 @@ class OnlineData:
         返回字段中同时包含最新一个交易日的单日和近 ``days`` 日汇总，
         满足按最新交易日（如 20260820）口径过滤以及原有评分的需求。
         """
-        if self._circuit_open():
+        if not self._available():
             return None
         cached = self._get_cached("flow", code, str(days))
         if cached:

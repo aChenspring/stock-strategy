@@ -195,7 +195,10 @@ def score_stock(
     defs = factor_defs if factor_defs is not None else build_factor_defs(config)
     rmap = build_rules_map(config)
 
-    scores = score_factor_set(defs, ctx, rmap)
+    # 在线数据整体不可用（fund/val/flow 全空）时，在线/实时因子给中性分，
+    # 避免 0 分稀释综合分；本地因子照常参与排序，结果不受影响。
+    online_empty = not any(online.get(k) for k in ("fund", "val", "flow"))
+    scores = score_factor_set(defs, ctx, rmap, online_empty=online_empty)
     total = total_score(defs, scores)
 
     return {

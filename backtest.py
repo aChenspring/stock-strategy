@@ -248,6 +248,47 @@ def _rsi_val(avg_g: float, avg_l: float) -> Optional[float]:
     return 100.0 - 100.0 / (1.0 + avg_g / avg_l)
 
 
+def _market_ok(market_close, market_ma20, di: int, enabled: bool = True,
+               mode: str = "strong", up_days: int = 3) -> bool:
+    """大盘过滤：全池等权指数与 20 日线的关系决定是否允许买入。
+
+    mode="above"：仅要求指数 >= 20 日线（原版弱过滤）；
+    mode="strong"：额外要求 20 日线处于上行（当前值高于 up_days 个
+    交易日前的值），即「指数在 20 日线上方 + 20 日线走多」。
+
+    enabled=False 或数据不足/缺失时视为通过。
+    """
+    if not enabled:
+        return True
+    if di >= len(market_close) or di >= len(market_ma20):
+        return True
+    mc, mma = market_close[di], market_ma20[di]
+    if mc is None or mma is None:
+        return True
+    if mc < mma:
+        return False
+    if mode == "strong":
+        j = di - up_days
+        if j >= 0:
+            prev = market_ma20[j]
+            # MA20 横盘/下行不放行；回看数据不足时只要求指数在线上方
+            if prev is not None and mma <= prev:
+                return False
+    return True
+
+
+def _pass_max_buy_pct(pct, max_buy_pct) -> bool:
+    """不追高过滤：当日涨幅超过 max_buy_pct(%) 不买。
+
+    max_buy_pct 为 None/<=0 表示不限制；pct 缺失时放行。
+    """
+    if not max_buy_pct or max_buy_pct <= 0:
+        return True
+    if pct is None:
+        return True
+    return pct <= max_buy_pct
+
+
 def _kdj(highs, lows, closes) -> tuple:
     n = len(closes)
     k = [50.0] * n; d = [50.0] * n
@@ -283,22 +324,36 @@ DEFAULT_BT_CONFIG: Dict[str, Any] = {
     "strategy": "factor_default",   # factor_default 或 v9 策略 key
     "start": "",                    # 留空 = 最近 120 交易日
     "end": "",                      # 留空 = 最新交易日
-    "init_cash": 1000000,
-    "top_n": 20,
-    "hold_days": 10,
+    "init_cash": 6000,              # 6000 元小资金场景（回测挖掘）
+    "top_n": 10,                    # 6000 元下持仓数最优（实际每只约600元）
+    "hold_days": 15,                # 6000 元小资金下低频持有更优（噪声小、摩擦少）
     "fee_rate": 0.0005,             # 单边手续费（含滑点）
-    "min_score": 65.0,              # 综合因子策略买入门槛
+    "min_score": 55.0,              # 综合因子策略买入门槛（50 组回测挖掘：55 优于 65）
     "stop_loss": -12.0,             # 止损 %
     "take_profit": 20.0,            # 止盈 %
-    "rebalance_every": 3,           # 每 N 个交易日重评一次
+    "rebalance_every": 2,           # 每 N 个交易日重评一次（挖掘：2 优于 3/1）
     "universe": "all",              # all=全A(逐日按历史数据重新选股) / hits=上次扫描命中池(仅验证当前选股，有前视偏差)
     "max_codes": 400,               # 最大参与标的数
     "pre_days": 60,                 # 指标预热交易日数
     "hits_codes": [],               # universe=hits 时传入
     "market_filter": True,          # 大盘等权指数跌破20日线时空仓，规避系统性下行
-    "max_buy_pct": 6.0,             # 当日涨幅超过该值(%)不追高；None/<=0 表示不限制
+    "market_filter_mode": "strong", # above=仅指数>20日线；strong=指数>20日线且20日线上行（挖掘：strong 显著优于 above）
+    "ma_up_days": 3,                # MA20 上行判断回看天数
+    "max_buy_pct": 6.0,             # 当日涨幅超过该值(%)不追高；None/<=0 表示不限制（6000元场景挖掘：6 优于 8）
     "config": None,                 # 策略配置（strategy_config.json 内容）
 }
+
+
+def _fit_top_n_to_cash(top_n: int, init_cash: float,
+                       min_per_stock: float = 600.0) -> int:
+    """持仓数随本金自适应：每只持仓至少保留约 min_per_stock 元预算
+    （≈1 手低价股），防止小资金 + 大 top_n 导致多数标的一手都买不起
+    而实际空仓。返回有效 top_n（1 ~ 传入值，随资金缩水）。"""
+    cash = float(init_cash or 0)
+    tn = int(top_n or 1)
+    if cash <= 0:
+        return max(1, tn)
+    return max(1, min(tn, max(1, int(cash / min_per_stock))))
 
 
 # ============ 主回测 ============
@@ -318,6 +373,8 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
 
     strategy_key = c["strategy"]
     use_factor = (strategy_key == "factor_default")
+    # 持仓数随本金自适应：6000 元下实际最多持仓约 10 只
+    c["top_n"] = _fit_top_n_to_cash(c.get("top_n"), c.get("init_cash"))
     # 回测只覆盖「本地历史(L) 且可回放」因子；
     # 其余因子（在线/实时/环境）不参与 defs，权重归一化时也不会稀释总分
     defs = [f for f in build_factor_defs(c.get("config"))
@@ -418,11 +475,11 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
 
         # 2b. 买入（调仓日）
         # 大盘过滤：全池等权指数跌破20日线 -> 空仓等待，不买入
-        skip_buy = False
-        if c.get("market_filter", True) and market_ma20[di] is not None \
-                and market_close[di] is not None \
-                and market_close[di] < market_ma20[di]:
-            skip_buy = True
+        skip_buy = not _market_ok(
+            market_close, market_ma20, di,
+            c.get("market_filter", True),
+            c.get("market_filter_mode", "strong"),
+            c.get("ma_up_days", 3))
         if di % c["rebalance_every"] == 0 and not skip_buy:
             cands: List[tuple] = []
             max_buy_pct = c.get("max_buy_pct") or None
@@ -434,8 +491,7 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
                     if ctx is None:
                         continue
                     # 不追高：当日涨幅过大不买（避免买在情绪高点/涨停日）
-                    if max_buy_pct is not None and ctx["pct"] is not None \
-                            and ctx["pct"] > max_buy_pct:
+                    if not _pass_max_buy_pct(ctx["pct"], max_buy_pct):
                         continue
                     scores = score_factor_set(defs, ctx, rmap,
                                               active_sources={SRC_LOCAL})
@@ -454,11 +510,17 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
                         continue
                     ctx9 = s.ctx_at(date)
                     # 不追高：当日涨幅过大不买
-                    if max_buy_pct is not None and ctx9 is not None \
-                            and ctx9["pct"] is not None \
-                            and ctx9["pct"] > max_buy_pct:
+                    if ctx9 is not None and \
+                            not _pass_max_buy_pct(ctx9["pct"], max_buy_pct):
                         continue
-                    cands.append((code, 100.0))
+                    # v9 硬条件命中后，按本地可回测因子综合分排序择优买入
+                    #（避免按代码字典序随机买入，v9 只做过滤、不设门槛）
+                    if ctx9 is not None:
+                        v9_scores = score_factor_set(defs, ctx9, rmap,
+                                                     active_sources={SRC_LOCAL})
+                        cands.append((code, total_score(defs, v9_scores)))
+                    else:
+                        cands.append((code, 0.0))
             cands.sort(key=lambda x: -x[1])
             budget = cash / max(1, min(c["top_n"], len(cands)))
             for code, _sc in cands[:c["top_n"]]:
