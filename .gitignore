@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 回测/扫描结果
+backtest_results/
+scan_result_*.xlsx
+_doc_out.txt
+
+# 数据缓存
+industry_cache.json
+industry_tree.json
+
+# IDE / 项目数据
+.codebuddy/
+.idea/
+.vscode/
+*.swp

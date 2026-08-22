@@ -171,6 +171,7 @@ class BacktestPage(QWidget):
             "买入/卖出价均为历史当日价格，无前视偏差。\n"
             "上次扫描命中池：仅用当前扫描选出的股票做历史回放，"
             "存在前视/选择偏差，仅用于验证当前选股的历史表现，结果偏乐观。")
+        self.cb_universe.currentIndexChanged.connect(self._on_universe_changed)
         self.ed_maxcodes = QLineEdit("400")
 
         grid.addWidget(QLabel("策略"), 0, 0)
@@ -287,17 +288,34 @@ class BacktestPage(QWidget):
 
     def _on_strategy_changed(self):
         key = self.cb_strategy.currentData()
+        base = ""
         if key == "factor_default":
-            self.lbl_coverage.setText(
-                "综合因子策略：回测仅覆盖本地历史(L)可回放因子 "
-                "（板块环境/题材/市场环境无历史回放数据；在线/实时因子不参与回测）")
+            base = ("综合因子策略：回测仅覆盖本地历史(L)可回放因子 "
+                    "（板块环境/题材/市场环境无历史回放数据；在线/实时因子不参与回测）")
         else:
             for s in V9_STRATEGIES:
                 if s["key"] == key:
-                    self.lbl_coverage.setText(
-                        f"{s['name']}：硬条件策略。在线字段在历史中无数据，"
-                        f"回测仅评估其本地硬条件部分（结果仅供参考）。")
+                    base = (f"{s['name']}：硬条件策略。在线字段在历史中无数据，"
+                            f"回测仅评估其本地硬条件部分（结果仅供参考）。")
                     break
+        self._lbl_coverage_base = base
+        self._refresh_coverage()
+
+    def _on_universe_changed(self):
+        self._refresh_coverage()
+
+    def _refresh_coverage(self):
+        mode = self.cb_universe.currentData()
+        if mode == "hits":
+            self.lbl_coverage.setText(
+                self._lbl_coverage_base +
+                " | 标的池=上次扫描命中池：仅验证当前选股的历史表现，"
+                "存在前视/选择偏差，结果偏乐观")
+        else:
+            self.lbl_coverage.setText(
+                self._lbl_coverage_base +
+                " | 标的池=全A(抽样)：每个历史交易日按当日数据重新选股，"
+                "价格均为历史当日价格，无前视偏差")
 
     def set_hits_codes(self, codes: List[str]):
         self._hits_codes = codes or []
