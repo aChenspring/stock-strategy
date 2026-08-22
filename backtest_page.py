@@ -107,7 +107,7 @@ class EquityChart(QWidget):
         n = len(navs)
         if n == 1:
             return
-        prev_pt = None
+        p"""  """rev_pt = None
         for i, nav in enumerate(navs):
             x = pad_l + pw * i / (n - 1)
             y = pad_t + ph * (hi - nav) / (hi - lo)
