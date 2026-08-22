@@ -11,13 +11,13 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QEvent
 from PySide6.QtGui import QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
     QPushButton, QLineEdit, QComboBox, QProgressBar, QTableWidget,
     QTableWidgetItem, QGroupBox, QMessageBox, QHeaderView, QFileDialog,
-    QAbstractItemView, QToolButton,
+    QAbstractItemView, QToolButton, QScrollArea, QFrame, QApplication,
 )
 
 from strategy_schema import (
@@ -135,11 +135,22 @@ class BacktestPage(QWidget):
 
     # ---------- UI ----------
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
 
         title = QLabel("回测管理：用本地历史验证策略，改完实现立刻验证效果")
         title.setStyleSheet("font-size:14px;font-weight:bold;margin:4px;")
-        root.addWidget(title)
+        outer.addWidget(title)
+
+        # 内容放入滚动区：窗口高度有限时，底部的交易明细不会“挤到屏幕外”
+        self._outer_scroll = QScrollArea()
+        self._outer_scroll.setWidgetResizable(True)
+        self._outer_scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setContentsMargins(4, 2, 4, 4)
+        root.setSpacing(4)
 
         # 配置区
         cfg_box = QGroupBox("回测配置")
@@ -248,9 +259,9 @@ class BacktestPage(QWidget):
         root.addWidget(self.metrics_widget)
         self.metrics_widget.hide()
 
-        # 净值曲线（可折叠）
+        # 净值曲线（可折叠，默认折叠：窗口高度有限时优先保证交易明细可见）
         self.chart = EquityChart()
-        root.addWidget(self._make_section_bar("净值曲线", self.chart))
+        root.addWidget(self._make_section_bar("净值曲线", self.chart, checked=False))
         root.addWidget(self.chart)
 
         # 交易明细（可折叠，默认展开）
@@ -262,18 +273,26 @@ class BacktestPage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        root.addWidget(self._make_section_bar("交易明细", self.table))
+        self.table.setMinimumHeight(240)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        # 表格滚动到边界时把滚轮转发给外层滚动区，避免表格把页面滚动“吃掉”
+        self.table.viewport().installEventFilter(self)
+        root.addWidget(self._make_section_bar("交易明细", self.table, checked=True))
         root.addWidget(self.table, 1)
+
+        self._outer_scroll.setWidget(content)
+        outer.addWidget(self._outer_scroll, 1)
 
         self._on_strategy_changed()
 
-    def _make_section_bar(self, title: str, target: QWidget) -> QToolButton:
+    def _make_section_bar(self, title: str, target: QWidget,
+                          checked: bool = True) -> QToolButton:
         """生成一个可折叠区域标题栏：点击展开/收起 target。"""
         btn = QToolButton()
         btn.setText(title)
         btn.setCheckable(True)
-        btn.setChecked(True)
-        btn.setArrowType(Qt.DownArrow)
+        btn.setChecked(checked)
+        btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         btn.setStyleSheet(
             "QToolButton { border:none; font-size:13px; font-weight:bold;"
@@ -286,6 +305,21 @@ class BacktestPage(QWidget):
     def _toggle_section(self, btn: QToolButton, target: QWidget, checked: bool):
         target.setVisible(checked)
         btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        # 交易明细滚动到顶部/底部边界时，把滚轮事件转发给外层滚动区
+        table = getattr(self, "table", None)
+        if (table is not None and obj is table.viewport()
+                and event.type() == QEvent.Type.Wheel
+                and getattr(self, "_outer_scroll", None) is not None):
+            sb = table.verticalScrollBar()
+            dy = event.angleDelta().y()
+            at_edge = (dy > 0 and sb.value() <= sb.minimum()) or \
+                      (dy < 0 and sb.value() >= sb.maximum())
+            if at_edge:
+                QApplication.sendEvent(self._outer_scroll.viewport(), event)
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_strategy_changed(self):
         key = self.cb_strategy.currentData()
