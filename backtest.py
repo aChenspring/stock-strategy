@@ -288,13 +288,15 @@ DEFAULT_BT_CONFIG: Dict[str, Any] = {
     "hold_days": 10,
     "fee_rate": 0.0005,             # 单边手续费（含滑点）
     "min_score": 65.0,              # 综合因子策略买入门槛
-    "stop_loss": -8.0,              # 止损 %
-    "take_profit": 15.0,            # 止盈 %
-    "rebalance_every": 1,           # 每 N 个交易日重评一次
+    "stop_loss": -12.0,             # 止损 %
+    "take_profit": 20.0,            # 止盈 %
+    "rebalance_every": 3,           # 每 N 个交易日重评一次
     "universe": "all",              # all=全A(逐日按历史数据重新选股) / hits=上次扫描命中池(仅验证当前选股，有前视偏差)
     "max_codes": 400,               # 最大参与标的数
     "pre_days": 60,                 # 指标预热交易日数
     "hits_codes": [],               # universe=hits 时传入
+    "market_filter": True,          # 大盘等权指数跌破20日线时空仓，规避系统性下行
+    "max_buy_pct": 6.0,             # 当日涨幅超过该值(%)不追高；None/<=0 表示不限制
     "config": None,                 # 策略配置（strategy_config.json 内容）
 }
 
@@ -353,6 +355,20 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
     axis = _market_axis(series_map, c["start"], dates_end)
     if len(axis) < 10:
         raise RuntimeError("回测区间交易日不足 10 天")
+
+    # ---- 4.5 大盘环境：全池等权指数 + MA20（用于大盘过滤/择时）----
+    market_close: List[Optional[float]] = []
+    last_mc: Optional[float] = None
+    for date in axis:
+        cs = []
+        for s in series_map.values():
+            i = s.index_at(date)
+            if i >= 0:
+                cs.append(s._data["close"][i])
+        v = sum(cs) / len(cs) if cs else last_mc
+        last_mc = v
+        market_close.append(v)
+    market_ma20 = _sma([v if v is not None else 0.0 for v in market_close], 20)
     prog("开始逐日模拟...", 16)
 
     # ---- 5. 逐日模拟 ----
@@ -401,14 +417,25 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
                 del holdings[code]
 
         # 2b. 买入（调仓日）
-        if di % c["rebalance_every"] == 0:
+        # 大盘过滤：全池等权指数跌破20日线 -> 空仓等待，不买入
+        skip_buy = False
+        if c.get("market_filter", True) and market_ma20[di] is not None \
+                and market_close[di] is not None \
+                and market_close[di] < market_ma20[di]:
+            skip_buy = True
+        if di % c["rebalance_every"] == 0 and not skip_buy:
             cands: List[tuple] = []
+            max_buy_pct = c.get("max_buy_pct") or None
             for code, s in series_map.items():
                 if code in holdings or not s.has_date(date):
                     continue
                 if use_factor:
                     ctx = s.ctx_at(date)
                     if ctx is None:
+                        continue
+                    # 不追高：当日涨幅过大不买（避免买在情绪高点/涨停日）
+                    if max_buy_pct is not None and ctx["pct"] is not None \
+                            and ctx["pct"] > max_buy_pct:
                         continue
                     scores = score_factor_set(defs, ctx, rmap,
                                               active_sources={SRC_LOCAL})
@@ -423,8 +450,15 @@ def run_backtest(cfg: Optional[Dict[str, Any]] = None,
                     if not ind:
                         continue
                     # 截至当日切片，避免前视偏差
-                    if check_strategy(strategy_key, s.rows[:i + 1], {}, ind):
-                        cands.append((code, 100.0))
+                    if not check_strategy(strategy_key, s.rows[:i + 1], {}, ind):
+                        continue
+                    ctx9 = s.ctx_at(date)
+                    # 不追高：当日涨幅过大不买
+                    if max_buy_pct is not None and ctx9 is not None \
+                            and ctx9["pct"] is not None \
+                            and ctx9["pct"] > max_buy_pct:
+                        continue
+                    cands.append((code, 100.0))
             cands.sort(key=lambda x: -x[1])
             budget = cash / max(1, min(c["top_n"], len(cands)))
             for code, _sc in cands[:c["top_n"]]:

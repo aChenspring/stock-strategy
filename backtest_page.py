@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLineEdit, QComboBox, QProgressBar, QTableWidget,
     QTableWidgetItem, QGroupBox, QMessageBox, QHeaderView, QFileDialog,
     QAbstractItemView, QToolButton, QScrollArea, QFrame, QApplication,
+    QCheckBox,
 )
 
 from strategy_schema import (
@@ -171,9 +172,9 @@ class BacktestPage(QWidget):
         self.ed_hold = QLineEdit("10")
         self.ed_fee = QLineEdit("0.0005")
         self.ed_minscore = QLineEdit("65")
-        self.ed_stop = QLineEdit("-8")
-        self.ed_profit = QLineEdit("15")
-        self.ed_rebal = QLineEdit("1")
+        self.ed_stop = QLineEdit("-12")
+        self.ed_profit = QLineEdit("20")
+        self.ed_rebal = QLineEdit("3")
         self.cb_universe = QComboBox()
         # 默认全A：每个历史交易日站在当日视角重新打分选股，避免拿当前选股套历史（前视偏差）
         self.cb_universe.addItem("全A（抽样）·逐日历史选股", "all")
@@ -185,6 +186,15 @@ class BacktestPage(QWidget):
             "存在前视/选择偏差，仅用于验证当前选股的历史表现，结果偏乐观。")
         self.cb_universe.currentIndexChanged.connect(self._on_universe_changed)
         self.ed_maxcodes = QLineEdit("400")
+        self.chk_market = QCheckBox("大盘过滤")
+        self.chk_market.setChecked(True)
+        self.chk_market.setToolTip(
+            "回测区间内，全池等权指数跌破其 20 日线时跳过买入（空仓等待），"
+            "可大幅减少震荡/下跌市的无效交易与回撤。")
+        self.ed_maxbuy = QLineEdit("6")
+        self.ed_maxbuy.setToolTip(
+            "调仓日当日涨幅超过该值(%)的股票不追高买入（避免买在情绪高点/涨停日）；"
+            "留空或填 0 表示不限制")
 
         grid.addWidget(QLabel("策略"), 0, 0)
         grid.addWidget(self.cb_strategy, 0, 1)
@@ -211,6 +221,9 @@ class BacktestPage(QWidget):
         grid.addWidget(self.cb_universe, 3, 5)
         grid.addWidget(QLabel("最大标的数"), 4, 0)
         grid.addWidget(self.ed_maxcodes, 4, 1)
+        grid.addWidget(self.chk_market, 4, 2)
+        grid.addWidget(QLabel("不追高涨幅%"), 4, 3)
+        grid.addWidget(self.ed_maxbuy, 4, 4)
 
         self.btn_run = QPushButton("运行回测")
         self.btn_run.clicked.connect(self._run)
@@ -224,12 +237,12 @@ class BacktestPage(QWidget):
         btns.addWidget(self.btn_run)
         btns.addWidget(self.btn_stop)
         btns.addWidget(self.btn_save)
-        grid.addLayout(btns, 4, 2, 1, 4)
+        grid.addLayout(btns, 5, 0, 1, 6)
 
         self.lbl_coverage = QLabel("")
         self.lbl_coverage.setWordWrap(True)
         self.lbl_coverage.setStyleSheet("color:#666;")
-        grid.addWidget(self.lbl_coverage, 5, 0, 1, 6)
+        grid.addWidget(self.lbl_coverage, 6, 0, 1, 6)
 
         root.addWidget(cfg_box)
 
@@ -377,6 +390,9 @@ class BacktestPage(QWidget):
             "rebalance_every": max(1, int(_f(self.ed_rebal, 1))),
             "universe": self.cb_universe.currentData(),
             "max_codes": int(_f(self.ed_maxcodes, 400)),
+            "market_filter": self.chk_market.isChecked(),
+            "max_buy_pct": (lambda v: v if v and v > 0 else None)(
+                _f(self.ed_maxbuy, 6.0)),
             "hits_codes": self._hits_codes,
             # 优先取策略管理页未保存的编辑态；无 provider 时回退已保存配置
             "config": (self.strategy_provider() if self.strategy_provider
