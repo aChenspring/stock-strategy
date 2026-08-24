@@ -18,19 +18,25 @@ from typing import Any, Dict, List, Optional
 # 若留到 PySide6 导入后再首次调用 zb/bk，会触发同样的 wrapper loop 异常。
 from stock_sdk import bk, warm_default_connection
 warm_default_connection()
+from collections import Counter
+
 from strategy_data import (
     MarketCache, OnlineData, load_market_rows, valid_trading_rows,
-    compute_indicators, compute_board_env, compute_market_env,
+    compute_board_env,
     build_industry_tree, load_industry_tree, save_industry_tree,
     aggregate_recent, guess_board, load_stock_boards, judge_yaogu,
     save_factor_snapshot, load_factor_snapshot, query_factor_scores,
     filter_factor_table, factor_freshness,
     START as START, END as END,
+    calc_window_start,
 )
-from factors import score_stock, FACTORS
+from factors import FACTORS
 from strategies import get_strategies, check_strategy, risk_warnings
-from strategy_schema import build_factor_defs
+from strategy_schema import build_factor_defs, build_rules_map
 import backtest  # noqa: F401  提前加载（含 warm），避免 PySide6 之后触发 shibokensupport
+from backtest import (DEFAULT_BT_CONFIG, scan_market_ok, IndicatorSeries, judge_at)
+from screen_common import (passes_market_filters, passes_indicator_filters,
+                           passes_online_filters, evaluate_buy, score_factor_local)
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -72,12 +78,15 @@ class ScanWorker(QThread):
 
     def __init__(self, strategy_key: str, candidate_limit: int = 300,
                  filters: Optional[Dict[str, Any]] = None,
-                 strategy_config: Optional[dict] = None):
+                 strategy_config: Optional[dict] = None,
+                 scan_end: str = "", scan_window: str = "6m"):
         super().__init__()
         self.strategy_key = strategy_key
         self.candidate_limit = candidate_limit
         self.filters = filters or {}
         self.strategy_config = strategy_config or {}
+        self.scan_end = scan_end or END
+        self.scan_window = scan_window or "6m"
         self._stop = False
 
     def stop(self):
@@ -85,227 +94,28 @@ class ScanWorker(QThread):
 
     # ---------- 过滤条件 ----------
     def _passes_market_filters(self, code: str, valid: List[dict]) -> bool:
-        """仅依赖行情行的快速过滤，在 compute_indicators 之前执行以提速。"""
-        f = self.filters
-        last = valid[-1]
-        name = str(last.get("name", ""))
-        close = last.get("close")
-        if close is None or close <= 0:
-            return False
+        """仅依赖行情行的快速过滤，在 compute_indicators 之前执行以提速。
 
-        # 市场板块
-        boards = f.get("boards", {})
-        if boards and any(boards.values()):
-            main = code.startswith(("60", "00"))
-            gem = code.startswith("30")
-            star = code.startswith("68")
-            bse = code.startswith("920")
-            matched = (
-                (main and boards.get("main")) or
-                (gem and boards.get("gem")) or
-                (star and boards.get("star")) or
-                (bse and boards.get("bse"))
-            )
-            if not matched:
-                return False
-
-        # 非ST
-        if f.get("non_st") and "ST" in name.upper():
-            return False
-
-        # 股价
-        price_min = f.get("price_min")
-        price_max = f.get("price_max")
-        if price_min is not None and close < price_min:
-            return False
-        if price_max is not None and close > price_max:
-            return False
-
-        # 成交额（界面单位为亿）
-        amount = _safe_float(last.get("amount"))
-        amount_min = f.get("amount_min")
-        amount_max = f.get("amount_max")
-        if amount_min is not None and (amount is None or amount < amount_min * 1e8):
-            return False
-        if amount_max is not None and (amount is None or amount > amount_max * 1e8):
-            return False
-
-        # 换手率
-        turnover = _safe_float(last.get("turnover"))
-        turnover_min = f.get("turnover_min")
-        turnover_max = f.get("turnover_max")
-        if turnover_min is not None and (turnover is None or turnover < turnover_min):
-            return False
-        if turnover_max is not None and (turnover is None or turnover > turnover_max):
-            return False
-
-        # 涨幅
-        pct = _safe_float(last.get("pct_chg"))
-        pct_min = f.get("pct_chg_min")
-        pct_max = f.get("pct_chg_max")
-        if pct_min is not None and (pct is None or pct < pct_min):
-            return False
-        if pct_max is not None and (pct is None or pct > pct_max):
-            return False
-
-        return True
+        与回测共用同一实现（screen_common），保证扫描/回测筛选口径一致。
+        """
+        return passes_market_filters(code, valid, self.filters)
 
     def _passes_indicator_filters(self, code: str, ind: Dict[str, Any],
                                   valid: List[dict]) -> bool:
-        """依赖 compute_indicators 产出的技术面过滤。"""
-        f = self.filters
-        close = _safe_float(ind.get("close"))
-        ma20 = _safe_float(ind.get("ma20"))
-        ma60 = _safe_float(ind.get("ma60"))
-        macd = _safe_float(ind.get("macd"))
-        rsi6 = _safe_float(ind.get("rsi6"))
+        """依赖 compute_indicators 产出的技术面过滤。
 
-        if f.get("close_above_ma20"):
-            if close is None or ma20 is None or close <= ma20:
-                return False
-        if f.get("ma20_above_ma60"):
-            if ma20 is None or ma60 is None or ma20 <= ma60:
-                return False
-        if f.get("close_above_ma60"):
-            if close is None or ma60 is None or close <= ma60:
-                return False
-        if f.get("macd_positive"):
-            if macd is None or macd <= 0:
-                return False
-        if f.get("break_high20"):
-            high20 = _safe_float(ind.get("high20"))
-            if close is None or high20 is None or close < high20 * 0.995:
-                return False
-        if f.get("limit_up_recent"):
-            has_limit = any(
-                (_safe_float(r.get("pct_chg")) or 0) >= 9.5
-                for r in valid[-5:]
-            )
-            if not has_limit:
-                return False
-
-        # RSI6 范围
-        rsi_min = f.get("rsi_min")
-        rsi_max = f.get("rsi_max")
-        if rsi_min is not None and (rsi6 is None or rsi6 < rsi_min):
-            return False
-        if rsi_max is not None and (rsi6 is None or rsi6 > rsi_max):
-            return False
-
-        # 量比范围
-        vol_ratio = _safe_float(ind.get("vol_ratio"))
-        vr_min = f.get("vol_ratio_min")
-        vr_max = f.get("vol_ratio_max")
-        if vr_min is not None and (vol_ratio is None or vol_ratio < vr_min):
-            return False
-        if vr_max is not None and (vol_ratio is None or vol_ratio > vr_max):
-            return False
-
-        return True
+        与回测共用同一实现（screen_common），保证扫描/回测筛选口径一致。
+        """
+        return passes_indicator_filters(code, ind, valid, self.filters)
 
     def _passes_online_filters(self, code: str, valid: List[dict],
                                online: Dict[str, Any], ind: Dict[str, Any]) -> bool:
-        """依赖在线财务/估值/资金流/行业的过滤。"""
-        f = self.filters
-        fund = online.get("fund") or {}
-        val = online.get("val") or {}
-        flow = online.get("flow") or {}
+        """依赖在线财务/估值/资金流/行业的过滤。
 
-        # 营收同比>0
-        if f.get("revenue_yoy_positive"):
-            rev = _safe_float(fund.get("revenue_yoy"))
-            if rev is not None and rev <= 0:
-                return False
-        # 净利同比>0
-        if f.get("profit_yoy_positive"):
-            profit = _safe_float(fund.get("profit_yoy"))
-            if profit is not None and profit <= 0:
-                return False
-        # 经营现金流>0
-        if f.get("cash_flow_positive"):
-            cash = _safe_float(fund.get("operating_cash_flow"))
-            if cash is not None and cash <= 0:
-                return False
-        # 主力净流入>0（最新交易日口径）
-        if f.get("main_flow_positive"):
-            main_net = _safe_float(flow.get("main_net_inflow_latest")) or _safe_float(flow.get("main_net_inflow"))
-            if main_net is not None and main_net <= 0:
-                return False
-
-        # 市值（界面单位为亿，接口为元）
-        market_cap = _safe_float(val.get("market_cap"))
-        mc_min = f.get("market_cap_min")
-        mc_max = f.get("market_cap_max")
-        if mc_min is not None and (market_cap is None or market_cap < mc_min * 1e8):
-            return False
-        if mc_max is not None and (market_cap is None or market_cap > mc_max * 1e8):
-            return False
-
-        # PE/PB/ROE
-        pe = _safe_float(val.get("pe_ratio")) or _safe_float(fund.get("pe_ratio"))
-        pb = _safe_float(val.get("pb_ratio")) or _safe_float(fund.get("pb_ratio"))
-        roe = _safe_float(fund.get("roe"))
-        for vmin, vmax, value in (
-            (f.get("pe_min"), f.get("pe_max"), pe),
-            (f.get("pb_min"), f.get("pb_max"), pb),
-            (f.get("roe_min"), f.get("roe_max"), roe),
-        ):
-            if vmin is not None and (value is None or value < vmin):
-                return False
-            if vmax is not None and (value is None or value > vmax):
-                return False
-
-        # 负债率上限
-        debt_max = f.get("debt_max")
-        if debt_max is not None:
-            debt = _safe_float(fund.get("debt_to_assets"))
-            if debt is None or debt > debt_max:
-                return False
-
-        # 股息率下限
-        dy_min = f.get("dividend_yield_min")
-        if dy_min is not None:
-            dy = _safe_float(fund.get("dividend_yield"))
-            if dy is None or dy < dy_min:
-                return False
-
-        # 行业过滤（三级联动：优先三级，其次二级，最后一级）
-        l3 = f.get("industry_l3")
-        l2 = f.get("industry_l2")
-        l1 = f.get("industry_l1")
-        if l3 and l3 != "全部":
-            try:
-                boards = bk.get(code, 3, "name")
-                if not isinstance(boards, list) or l3 not in boards:
-                    return False
-            except Exception:
-                return False
-        elif l2 and l2 != "全部":
-            try:
-                boards = bk.get(code, 2, "name")
-                if not isinstance(boards, list) or l2 not in boards:
-                    return False
-            except Exception:
-                return False
-        elif l1 and l1 != "全部":
-            try:
-                boards = bk.get(code, 1, "name")
-                if not isinstance(boards, list) or l1 not in boards:
-                    return False
-            except Exception:
-                return False
-
-        # 概念板块过滤
-        concept = f.get("concept")
-        if concept and concept != "全部":
-            try:
-                boards = bk.get(code, 0, "name")
-                if not isinstance(boards, list) or concept not in boards:
-                    return False
-            except Exception:
-                return False
-
-        return True
+        与回测共用同一实现（screen_common）；回测无历史在线数据时
+        按“数据缺失放行”处理，与扫描在线不可用时行为一致。
+        """
+        return passes_online_filters(code, valid, online, ind, self.filters)
 
     def run(self):
         try:
@@ -315,71 +125,116 @@ class ScanWorker(QThread):
                  if s["key"] == self.strategy_key), None)
 
             self.progress.emit(2, "加载行情数据...")
-            rows_by_code = load_market_rows(PREFIXES, START, END)
-            self.progress.emit(10, f"行情加载完成，共{len(rows_by_code)}只股票")
+            scan_start = calc_window_start(self.scan_end, self.scan_window)
+            rows_by_code = load_market_rows(PREFIXES, scan_start, self.scan_end)
+            self.progress.emit(10, f"行情加载完成，共{len(rows_by_code)}只股票（{scan_start}~{self.scan_end}）")
 
             # 技术面初筛 + 行情过滤（最快，先缩小范围）
+            # market_pool 为全池（仅要求足够K线、不做行情过滤），与回测
+            # series_map 口径一致，用于大盘等权指数，避免候选池截断导致指数失真。
             candidates = {}
+            market_pool = {}
             for code, rows in rows_by_code.items():
                 if self._stop:
                     break
                 valid = valid_trading_rows(rows)
                 if len(valid) < 60:
                     continue
+                market_pool[code] = valid
                 if not self._passes_market_filters(code, valid):
                     continue
                 candidates[code] = valid
             self.progress.emit(20, f"行情过滤后候选池{len(candidates)}只")
 
-            # 计算技术指标
-            self.progress.emit(25, "计算技术指标...")
-            indicators = compute_indicators(candidates)
+            # 技术指标统一用与回测相同的 IndicatorSeries 本地计算（compute_indicators
+            # 为 rd 接口指标，算法口径与回测本地自算不一致，会导致两端命中漂移）。
 
             # 板块/行业信息（一次查询全部候选，供环境分与列表展示复用）
             self.progress.emit(28, "查询板块与行业信息...")
             board_info_map = load_stock_boards(list(candidates.keys()))
 
-            # 板块环境 + 市场环境
-            self.progress.emit(30, "计算板块与市场环境...")
+            # 板块环境分（仅用于列表展示；判定综合分已统一为 score_factor_local）
+            self.progress.emit(30, "计算板块环境...")
             board_env = compute_board_env(candidates, board_info_map)
-            market_env = compute_market_env(candidates)
 
-            # 策略迭代：因子定义按当前配置预构建一次（粗排与线程池内只读复用）
+            # 大盘过滤（参数以回测挖掘结果 DEFAULT_BT_CONFIG 为准，避免两端漂移）：
+            # 全池等权指数与回测同口径；oversold 模式：指数 RSI 未超卖时判定为
+            # 非入场窗口，扫描结果不再推荐（均值回归市场超卖入场的前向收益显著为正）。
+            bt_cfg = DEFAULT_BT_CONFIG
+            if bt_cfg.get("market_filter", True):
+                market_ok = scan_market_ok(
+                    market_pool,
+                    mode=bt_cfg.get("market_filter_mode", "oversold"),
+                    ma_days=20,
+                    up_days=bt_cfg.get("ma_up_days", 3),
+                    rsi_threshold=bt_cfg.get("market_rsi_threshold", 40.0),
+                    chg20_max=bt_cfg.get("market_chg20_max"),
+                    chg20_max2=bt_cfg.get("market_chg20_max2"),
+                    chg60_min=bt_cfg.get("market_chg60_min"))
+            else:
+                market_ok = True
+            if not market_ok:
+                self.progress.emit(30, "大盘过滤：非超卖入场窗口（指数RSI未低于阈值），将不推荐买入")
+
+            # 策略迭代：因子定义/规则映射按当前配置预构建一次（粗排与线程池内只读复用）
             fdefs = build_factor_defs(self.strategy_config)
+            rmap = build_rules_map(self.strategy_config)
 
-            # 粗排：本地因子快速打分，仅取前 candidate_limit 只进入在线精筛。
-            # 在线查询（财务/估值/资金流）是最耗时环节，粗排可砍掉约 90% 的在线请求，
-            # 是 3000+ 只全量扫描 3 小时 → 十几分钟的关键（默认候选池上限 300）。
-            if self.candidate_limit and len(candidates) > self.candidate_limit:
+            # 扫描判定日 = 候选池最新交易日（取众数；少数停牌股当日无数据时跳过，
+            # 与回测 has_date(date) 行为一致）
+            last_date = Counter(r[-1]["date"] for r in candidates.values()).most_common(1)[0][0]
+            _s_cache: Dict[str, IndicatorSeries] = {}
+
+            def _get_series(code: str) -> IndicatorSeries:
+                s = _s_cache.get(code)
+                if s is None:
+                    s = IndicatorSeries(code, candidates[code])
+                    _s_cache[code] = s
+                return s
+
+            # 在线可用性探测：在线数据慢（每只 0.5~2s）是全量精筛的瓶颈。
+            # 在线可用 → 粗排截断候选池，控制精筛耗时；
+            # 在线不可用（接口返回空）→ 精筛为纯本地评分（毫秒级），全量精筛不截断丢票。
+            cache = MarketCache()
+            online_data = OnlineData(cache)
+            online_ok = online_data.probe_online(list(candidates.keys()))
+
+            if online_ok and self.candidate_limit and len(candidates) > self.candidate_limit:
                 self.progress.emit(32, f"本地因子粗排 {len(candidates)} 只，取前 {self.candidate_limit} 只精筛...")
 
                 def _rough(code):
                     if self._stop:
                         return code, -1.0
-                    ind = indicators.get(code, {})
-                    sc = score_stock(code, candidates[code], ind,
-                                     board_env.get(code, 0), market_env, {},
-                                     config=self.strategy_config, factor_defs=fdefs)
-                    return code, (sc.get("score", 0.0) if sc else -1.0)
+                    s = _get_series(code)
+                    if not s.has_date(last_date):
+                        return code, -1.0
+                    i = s.index_at(last_date)
+                    recent = s.rows[max(0, i - 4):i + 1]
+                    ind = s.indicator_at(last_date)
+                    if not ind:
+                        return code, -1.0
+                    scored = score_factor_local(fdefs, recent, ind, rmap)
+                    return code, scored["total"]
 
                 with ThreadPoolExecutor(max_workers=8) as pool:
                     rough = dict(pool.map(_rough, candidates))
                 top = sorted(rough, key=lambda c: rough[c], reverse=True)[:self.candidate_limit]
                 candidates = {c: candidates[c] for c in top}
                 self.progress.emit(35, f"粗排后精筛候选池 {len(candidates)} 只")
+            elif online_ok:
+                self.progress.emit(35, f"候选池 {len(candidates)} 只（在线可用）")
+            else:
+                self.progress.emit(35, f"在线数据不可用，全量精筛 {len(candidates)} 只（纯本地评分，不截断）")
 
-            # 批量加载在线财务数据（接口不可用时快速跳过）
-            self.progress.emit(36, "加载在线财务数据...")
-            cache = MarketCache()
-            online_data = OnlineData(cache)
-            online_data.fundamentals_batch(list(candidates.keys()), batch=100)
-            # pipe 批量预热估值/资金流本地缓存，评分循环内逐只命中内存
-            # 注意 date 必须与接口缓存键一致：valuation->latest, money_flow(days=5)->"5"
-            online_data.prewarm([("val", "latest"), ("flow", "5")],
-                                list(candidates.keys()))
-            # 在线可用性探测：在线接口返回空列表不触发熔断，会导致每只都空转请求。
-            # 采样全部为空时本次扫描内短路在线请求（评分循环直接内存返回 None）。
-            if not online_data.probe_online(list(candidates.keys())):
+            # 在线可用才做批量加载/预热；不可用时评分循环内全部内存短路。
+            if online_ok:
+                self.progress.emit(36, "加载在线财务数据...")
+                online_data.fundamentals_batch(list(candidates.keys()), batch=100)
+                # pipe 批量预热估值/资金流本地缓存，评分循环内逐只命中内存
+                # 注意 date 必须与接口缓存键一致：valuation->latest, money_flow(days=5)->"5"
+                online_data.prewarm([("val", "latest"), ("flow", "5")],
+                                    list(candidates.keys()))
+            else:
                 self.progress.emit(37, "在线数据不可用，已切换纯本地因子评分（结果不受影响）")
 
             total = len(candidates)
@@ -387,40 +242,41 @@ class ScanWorker(QThread):
             passed_count = 0
 
             def process(code):
-                """单只股票评分（线程池并行执行）"""
-                rows = candidates[code]
-                valid = valid_trading_rows(rows)
-                if not valid:
+                """单只股票评分（线程池并行执行），判定与回测共用 judge_at 同源。
+
+                return_fail=True：判定不通过（大盘过滤/过滤链/策略未命中）也返回
+                verdict，由 passed/limit_ok 标记红/绿/灰色展示，避免大盘过滤
+                不通过时结果表整体为空（0 命中）。
+                """
+                s = _get_series(code)
+                r = judge_at(s, last_date, self.filters, market_ok,
+                             DEFAULT_BT_CONFIG.get("max_buy_pct"),
+                             self._strategy_min_score if self._strategy_min_score is not None else 0.0,
+                             fdefs, rmap,
+                             use_factor=self._strategy_min_score is not None,
+                             strategy_key=self.strategy_key,
+                             return_fail=True)
+                if r is None:
                     return None
-                ind = indicators.get(code, {})
-                # 获取在线数据（批量已预热，单只命中缓存；不可用时快速返回）
+                recent, ind, scored = r["recent"], r["ind"], r["scored"]
+                hist = s.rows[:s.index_at(last_date) + 1]
+                # 在线数据仅用于展示；判定已由 judge_at 完成，与在线数据解耦
                 fund = online_data.fundamentals(code) or {}
                 val = online_data.valuation(code)
                 flow = online_data.money_flow(code, days=5) or {}
                 online = {"fund": fund or {}, "val": val or {}, "flow": flow}
-
-                # 本地14因子评分（不依赖在线数据，保证全量都有分）
-                # 传入已过滤的 valid，避免 score_stock 内重复 valid_trading_rows
                 board_score = board_env.get(code, 0)
-                scored = score_stock(code, valid, ind, board_score, market_env, online,
-                                     config=self.strategy_config, factor_defs=fdefs)
-
-                # 命中判定：指标过滤 + 在线过滤 + 策略命中。
-                # 综合因子策略（factor_default）按综合分门槛命中，v9 策略按 check 硬条件命中。
-                if self._strategy_min_score is not None:
-                    strat_hit = scored["total"] >= self._strategy_min_score
-                else:
-                    strat_hit = check_strategy(self.strategy_key, valid, online, indicators=ind)
-                ok = (
-                    self._passes_indicator_filters(code, ind, valid)
-                    and self._passes_online_filters(code, valid, online, ind)
-                    and strat_hit
-                )
-                warnings = risk_warnings(valid, online, indicators=ind)
-
-                # ---- 组装完整展示字段（查询日近5日口径） ----
-                return self._build_result(code, valid, ind, online, scored, board_score, warnings,
-                                           board_info_map, ok)
+                verdict = r["verdict"]
+                passed = verdict["ok"]
+                limit_ok = verdict["limit_ok"]
+                warnings = risk_warnings(hist, online, indicators=ind)
+                for w in verdict.get("warnings") or []:
+                    if w not in warnings:
+                        warnings.append(w)
+                result = self._build_result(code, hist, ind, online, scored, board_score, warnings,
+                                            board_info_map, passed)
+                result["limit_ok"] = limit_ok
+                return result
 
             # ---- 并行扫描评分（线程池） ----
             futs = {}
@@ -645,6 +501,25 @@ RESULT_COLUMNS = [
 
 
 # ============ 行业列表加载线程 ============
+class KlineLoadWorker(QThread):
+    """后台加载个股日K，避免点击表格行时在主线程做同步行情查询导致 UI 卡顿。"""
+    loaded = Signal(str, list)   # (code, rows)
+
+    def __init__(self, code: str, start: str = START, end: str = END, parent=None):
+        super().__init__(parent)
+        self._code = code
+        self._start = start
+        self._end = end
+
+    def run(self):
+        try:
+            rows = load_market_rows([f"{self._code[0]}*"], self._start, self._end)
+            rows = rows.get(self._code, [])
+        except Exception:
+            rows = []
+        self.loaded.emit(self._code, rows)
+
+
 class LoadIndustriesWorker(QThread):
     finished_signal = Signal(dict)
 
@@ -708,8 +583,12 @@ class FilterPanel(QFrame):
         self.cb_gem = QCheckBox("创业板")
         self.cb_star = QCheckBox("科创板")
         self.cb_bse = QCheckBox("北交所")
-        # 默认仅勾选主板，其余板块需手动勾选
+        # 默认全市场勾选（与回测调优口径 DEFAULT_SCAN_FILTERS 一致），
+        # 避免扫描默认口径与回测漂移导致两端结果不可比
         self.cb_main.setChecked(True)
+        self.cb_gem.setChecked(True)
+        self.cb_star.setChecked(True)
+        self.cb_bse.setChecked(True)
         for cb in (self.cb_main, self.cb_gem, self.cb_star, self.cb_bse):
             board_layout.addWidget(cb)
         board_layout.addStretch()
@@ -1161,9 +1040,9 @@ class ResultTableModel(QAbstractTableModel):
     @staticmethod
     def _color(r: dict, key: str):
         full = r.get("full") or {}
-        # 未命中策略：整行绿色（不合格）
+        # 未命中策略：参数限制通过 → 绿色（合格观察池）；参数限制未通过 → 灰色（不追高/大盘过滤）
         if not r.get("passed", True):
-            return QColor("#4caf50")
+            return QColor("#9e9e9e") if not r.get("limit_ok", True) else QColor("#4caf50")
         if key == "score":
             s = r.get("score", 0)
             return QColor("#e53935") if s >= 70 else QColor("#f57c00") if s >= 60 else QColor("#757575")
@@ -1217,7 +1096,8 @@ class DetailWindow(QWidget):
     def _build_text(r: dict) -> str:
         lines = [
             f"综合分: {r.get('score', 0):.1f}",
-            f"命中策略: {'是(红色)' if r.get('passed') else '否(绿色)'}",
+            f"命中策略: {'是(红色)' if r.get('passed') else '否'} | "
+            f"参数限制: {'通过(绿色)' if r.get('limit_ok', True) else '未通过(灰色)'}",
             "风控提示: " + ("; ".join(r.get("warnings")) if r.get("warnings") else "无"),
         ]
         fs = r.get("factor_scores") or {}
@@ -1245,6 +1125,8 @@ class MainWindow(QMainWindow):
         self.worker: Optional[ScanWorker] = None
         self.kline_cache: Dict[str, List[dict]] = {}
         self.industry_worker: Optional[LoadIndustriesWorker] = None
+        self._kline_worker: Optional[KlineLoadWorker] = None
+        self._pending_detail: Optional[dict] = None
 
         self._build_ui()
         self._connect()
@@ -1275,6 +1157,20 @@ class MainWindow(QMainWindow):
         self.export_btn = QPushButton("导出Excel")
         self.export_btn.setEnabled(False)
         top_bar.addWidget(self.export_btn)
+
+        top_bar.addWidget(QLabel(" 扫描截至:"))
+        self.ed_scan_end = QLineEdit(END)
+        self.ed_scan_end.setFixedWidth(90)
+        self.ed_scan_end.setToolTip("扫描截面日期，YYYYMMDD，默认最近交易日")
+        top_bar.addWidget(self.ed_scan_end)
+        top_bar.addWidget(QLabel(" 数据窗口:"))
+        self.cb_scan_window = QComboBox()
+        self.cb_scan_window.addItem("3个月", "3m")
+        self.cb_scan_window.addItem("6个月", "6m")
+        self.cb_scan_window.addItem("1年", "1y")
+        self.cb_scan_window.addItem("2年", "2y")
+        self.cb_scan_window.setCurrentText("6个月")
+        top_bar.addWidget(self.cb_scan_window)
 
         top_bar.addStretch()
         self.status_label = QLabel("就绪")
@@ -1429,9 +1325,12 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
+        scan_end = self.ed_scan_end.text().strip()
+        scan_window = self.cb_scan_window.currentData()
         self.worker = ScanWorker(
             strategy_key, filters=filters,
-            strategy_config=self.strategy_page.current_config())
+            strategy_config=self.strategy_page.current_config(),
+            scan_end=scan_end, scan_window=scan_window)
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_signal.connect(self.on_scan_done)
         self.worker.error_signal.connect(self.on_error)
@@ -1517,9 +1416,11 @@ class MainWindow(QMainWindow):
             return
         passed = sum(1 for r in self.results if r.get("passed"))
         strong = sum(1 for r in self.results if r.get("passed") and r["score"] >= 70)
+        limit_ok = sum(1 for r in self.results if not r.get("passed") and r.get("limit_ok"))
         self.summary_label.setText(
-            f"共 {len(self.results)} 只 | 命中策略 {passed} 只（红色，其中高分≥70: {strong}） | "
-            f"未命中 {len(self.results) - passed} 只（绿色）"
+            f"共 {len(self.results)} 只 | 命中 {passed} 只（红/橙，高分≥70: {strong}） | "
+            f"限制通过未命中 {limit_ok} 只（绿） | "
+            f"限制未通过 {len(self.results) - passed - limit_ok} 只（灰）"
         )
 
     def on_select(self, selected=None, deselected=None):
@@ -1530,13 +1431,30 @@ class MainWindow(QMainWindow):
         if not r:
             return
         code = r.get("code", "")
-        # 加载K线（缓存）
+        self._pending_detail = r
         if code and code not in self.kline_cache:
-            try:
-                all_rows = load_market_rows([f"{code[0]}*"], START, END)
-                self.kline_cache[code] = all_rows.get(code, [])
-            except Exception:
-                self.kline_cache[code] = []
+            # K线未缓存：后台线程加载，完成后自动弹出详情，避免主线程阻塞
+            self._load_kline_async(code)
+            return
+        self._show_detail(r)
+
+    def _load_kline_async(self, code: str):
+        old = self._kline_worker
+        if old is not None:
+            if not old.isRunning():
+                old.deleteLater()
+        self._kline_worker = KlineLoadWorker(code, parent=self)
+        self._kline_worker.loaded.connect(self._on_kline_loaded)
+        self._kline_worker.start()
+        self.status_label.setText(f"正在加载 {code} K线...")
+
+    def _on_kline_loaded(self, code: str, rows: List[dict]):
+        self.kline_cache[code] = rows
+        r = self._pending_detail
+        if r and r.get("code") == code:
+            self._show_detail(r)
+
+    def _show_detail(self, r: dict):
         if not hasattr(self, "_detail_win") or self._detail_win is None:
             self._detail_win = DetailWindow()
         self._detail_win.show_result(r, self.kline_cache)

@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "C:\Users\wxb\CodeBuddy\20250928162354\_diag_today_scan.py", line 137, in <module>
+    f"×ÛºÏ·Ö max={scores[0]:.1f} p90={pct(scores, .9):.1f} p75={pct(scores, .75):.1f} "
+                  ~~~~~~^^^
+IndexError: list index out of range

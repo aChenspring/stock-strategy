@@ -112,6 +112,10 @@ def build_factor_ctx(valid, ind, board_score, market_score, online) -> Dict[str,
         avg5 = sum(vols[-6:-1]) / 5
         vol_ratio = volume / avg5 if avg5 > 0 else 1.0
 
+    # 近5/20日涨跌幅（超跌反弹策略核心：低位企稳、不追高）
+    chg5 = (close / closes[-6] - 1) * 100 if len(closes) >= 6 and closes[-6] else None
+    chg20 = (close / closes[-21] - 1) * 100 if len(closes) >= 21 and closes[-21] else None
+
     limit_up_5 = 0
     for i in range(max(0, len(valid) - 5), len(valid)):
         p = _finite(valid[i].get("pct_chg"))
@@ -150,6 +154,7 @@ def build_factor_ctx(valid, ind, board_score, market_score, online) -> Dict[str,
     return {
         "close": close, "pct": pct, "amount": amount, "turnover": turnover,
         "volume": volume, "amplitude": amplitude,
+        "chg5": chg5, "chg20": chg20,
         "vol_ratio": vol_ratio, "limit_up_5": limit_up_5,
         "is_break": is_break, "profit_ratio": profit_ratio,
         "bull_arrange": bull_arrange,

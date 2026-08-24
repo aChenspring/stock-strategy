@@ -577,10 +577,85 @@ def _check_attack(calc: Dict[str, Any], valid: List[dict], online: Dict[str, Any
     return True
 
 
+def _is_limit_up_row(row: Dict[str, Any], code: str) -> bool:
+    """按板块判定单根K线是否涨停（口径与挖掘脚本一致）。
+
+    主板 10%（pct>=9.5）/ 创业板·科创板 20%（>=19.5）/
+    北交所 30%（>=29.5）/ ST 5%（>=4.5）。
+    """
+    pct = _finite(row.get("pct_chg")) or 0.0
+    st = bool(row.get("is_st")) or "ST" in str(row.get("name", "")).upper()
+    if st:
+        return pct >= 4.5
+    if code.startswith(("30", "68")):
+        return pct >= 19.5
+    if code.startswith("920"):
+        return pct >= 29.5
+    return pct >= 9.5
+
+
+def _check_limit5(calc: Dict[str, Any], valid: List[dict], online: Dict[str, Any]) -> bool:
+    """v9Limit5 连板启动预警：识别次日可能启动连续涨停（≥5板）的股票。
+
+    特征来自 2024-01 以来全市场连续涨停≥5日事件的挖掘（正样本=启动前一日）：
+    - 涨停基因：近20日涨停≥2 且 近60日涨停≥8 且 距上次涨停≤45日（最强判别，~11x）
+    - 趋势：收盘站上MA20（偏离0~25%）且不深破MA60（偏离>-5%）
+    - 当日未涨停（pct_chg<8）：启动前一日而非已涨停日
+    - 市值≤100亿（可选字段，缺失不约束）
+    仅依赖本地量价，扫描与回测判定天然一致。
+    """
+    if len(valid) < 65:
+        return False
+    last = valid[-1]
+    # 非 ST
+    name = str(last.get("name", "")) if last else ""
+    if "ST" in name.upper():
+        return False
+    code = str(last.get("code", "")) if last else ""
+    n = len(valid)
+    # 涨停基因统计
+    limit20 = limit60 = 0
+    days_since = -1
+    for k in range(n - 1, -1, -1):
+        if _is_limit_up_row(valid[k], code):
+            limit60 += 1
+            if k >= n - 20:
+                limit20 += 1
+            if days_since < 0:
+                days_since = (n - 1) - k
+    if limit20 < 2 or limit60 < 8:
+        return False
+    if days_since < 0 or days_since > 45:
+        return False
+    # 当日未涨停（启动前一日形态，避免追在已涨停日）
+    pct = _finite(last.get("pct_chg")) if last else None
+    if pct is not None and pct >= 8:
+        return False
+    # 趋势：站上MA20且偏离0~25%，不深破MA60（偏离>-5%）
+    close = calc.get("close")
+    ma20 = calc.get("ma20")
+    ma60 = calc.get("ma60")
+    if close is None or ma20 is None or ma60 is None:
+        return False
+    dev20 = (close / ma20 - 1) * 100 if ma20 else 0.0
+    dev60 = (close / ma60 - 1) * 100 if ma60 else 0.0
+    if not (0 < dev20 <= 25):
+        return False
+    if dev60 <= -5:
+        return False
+    # 市值≤100亿（float_mv 单位为元；字段缺失不约束）
+    fmv = _finite(last.get("float_mv")) if last else None
+    if fmv is not None and fmv > 1e10:
+        return False
+    return True
+
+
 # ============ 策略注册表 ============
 # 综合因子策略：无硬条件，命中由「综合因子分 >= min_score」判定（扫描端应用）。
-# min_score=55 为参数挖掘得到的最优门槛，与回测 DEFAULT_BT_CONFIG["min_score"] 保持一致。
-FACTOR_DEFAULT_MIN_SCORE = 55.0
+# min_score=48：oversold 深度超卖场景候选综合分实际上限约 48 分（抽样诊断：
+# 23 个买入日 max=48.0, p90=42.0），55 分在该场景不可达会导致当天扫描 0 命中。
+# 与回测 DEFAULT_BT_CONFIG["min_score"] 保持一致。
+FACTOR_DEFAULT_MIN_SCORE = 48.0
 
 
 def _check_factor_default(calc: dict, valid: List[dict], online: Dict[str, Any]) -> bool:
@@ -597,7 +672,7 @@ def get_strategies() -> List[Dict[str, Any]]:
         {
             "key": "factor_default",
             "name": "综合因子策略",
-            "desc": "14因子加权综合分≥55（回测挖掘最优门槛，可在策略页迭代编辑因子与权重）",
+            "desc": "14因子加权综合分≥48（oversold深度场景候选实际上限48，可在策略页迭代编辑因子与权重）",
             "check": _check_factor_default,
             "min_score": FACTOR_DEFAULT_MIN_SCORE,
         },
@@ -678,6 +753,12 @@ def get_strategies() -> List[Dict[str, Any]]:
             "name": "v9Attack 进攻型",
             "desc": "成交活跃与动量，小市值，放量，近5日有涨停，主力净流入",
             "check": _check_attack,
+        },
+        {
+            "key": "v9Limit5",
+            "name": "v9Limit5 连板启动前一日",
+            "desc": "涨停基因（近20日涨停≥2/近60日≥8/距上次涨停≤45日）+站上MA20+市值≤100亿，识别次日启动连续涨停",
+            "check": _check_limit5,
         },
     ]
 

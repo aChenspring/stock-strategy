@@ -33,6 +33,56 @@ def _nearest_trade_date(dt: datetime) -> str:
     return dt.strftime("%Y%m%d")
 
 
+def shift_days(date_str: str, days: int) -> str:
+    """按自然日平移日期（YYYYMMDD -> YYYYMMDD）。"""
+    try:
+        dt = datetime.strptime(date_str, "%Y%m%d")
+    except Exception:
+        dt = datetime.strptime(END, "%Y%m%d")
+    return (dt + timedelta(days=days)).strftime("%Y%m%d")
+
+
+def shift_months(date_str: str, months: int) -> str:
+    """按自然月平移日期，日末按该月最后一天裁剪。"""
+    try:
+        dt = datetime.strptime(date_str, "%Y%m%d")
+    except Exception:
+        dt = datetime.strptime(END, "%Y%m%d")
+    year = dt.year
+    month = dt.month + months
+    year += (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    max_day = [31, 29 if (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0) else 28,
+               31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    day = min(dt.day, max_day)
+    return f"{year:04d}{month:02d}{day:02d}"
+
+
+def calc_window_start(end_date: str, window: str) -> str:
+    """根据窗口描述计算起始日期。
+
+    扫描窗口（自然月/年）: 3m, 6m, 1y, 2y
+    回测窗口（交易日数，按 1 交易日≈1.6 自然日估算）: 30, 60, 120, 250, 500
+    """
+    if not end_date:
+        end_date = END
+    w = str(window).strip().lower()
+    if w.endswith("m"):
+        return shift_months(end_date, -int(w[:-1]))
+    if w.endswith("y"):
+        return shift_months(end_date, -int(w[:-1]) * 12)
+    if w.isdigit():
+        return shift_days(end_date, -int(w) * 2)
+    return shift_months(end_date, -6)
+
+
+def calc_backtest_pre_start(end_date: str, window: str, pre_days: int = 60) -> tuple:
+    """回测用：根据结束日期、回测窗口和预热天数，计算回测起始日期与指标预计算起始日期。"""
+    bt_start = calc_window_start(end_date, window)
+    pre_start = shift_days(bt_start, -pre_days * 2)
+    return bt_start, pre_start
+
+
 _today = datetime.now()
 # 默认数据范围：最近 6 个月到最近交易日（rd.vals 会自动截断到实际最新数据）
 START = (_today - timedelta(days=180)).strftime("%Y%m%d")

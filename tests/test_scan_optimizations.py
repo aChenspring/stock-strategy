@@ -9,6 +9,7 @@ from strategies import _calc_indicators_from_rows, check_strategy, get_strategie
 from strategy_schema import (
     build_factor_defs, default_rules, score_factor_set, total_score,
 )
+from tests.conftest import closes_to_rows, trading_dates
 
 
 def _ctx_factory():
@@ -96,7 +97,7 @@ def test_get_strategies_includes_factor_default():
     strategies = get_strategies()
     fd = next((s for s in strategies if s["key"] == "factor_default"), None)
     assert fd is not None, "扫描下拉框缺少综合因子策略"
-    assert fd["min_score"] == 55.0
+    assert fd["min_score"] == 48.0
     assert callable(fd["check"])
     # 所有 v9 策略仍保留
     assert "v9Screen" in [s["key"] for s in strategies]
@@ -105,3 +106,62 @@ def test_get_strategies_includes_factor_default():
 def test_check_strategy_factor_default_hits():
     """综合因子策略无硬条件：check_strategy 恒命中（门槛由综合分判定）。"""
     assert check_strategy("factor_default", _make_rows(), {}) is True
+
+
+# ---------- v9Limit5 连板启动前一日 ----------
+def _limit5_closes(limit_days, n=100, base=10.0, daily=0.004):
+    """构造收盘价序列：limit_days 为涨停日索引集合，其余日按 daily 温和变化。"""
+    closes = []
+    px = base
+    for j in range(n):
+        if j in limit_days:
+            px *= 1.10
+        else:
+            px *= (1 + daily)
+        closes.append(round(px, 2))
+    return closes
+
+
+def test_get_strategies_includes_v9_limit5():
+    """注册表应包含 v9Limit5 连板启动前一日策略（扫描下拉框来源）。"""
+    strategies = get_strategies()
+    s = next((s for s in strategies if s["key"] == "v9Limit5"), None)
+    assert s is not None, "扫描下拉框缺少 v9Limit5 策略"
+    assert callable(s["check"])
+    assert "连板" in s["name"]
+
+
+def test_check_strategy_v9_limit5_hits_prelaunch_day():
+    """连板启动前一日形态应命中：近20日涨停>=2/近60日>=8/距上次涨停<=45日，
+    收盘站上MA20（偏离0~25%）且收盘>MA60（偏离>-5%），当日未涨停、非ST。"""
+    limit_days = {52, 56, 60, 64, 68, 72, 76, 82, 87, 92}
+    rows = closes_to_rows(_limit5_closes(limit_days), code="600000", name="测试")
+    calc = _calc_indicators_from_rows(rows)
+    dev20 = (calc["close"] / calc["ma20"] - 1) * 100
+    dev60 = (calc["close"] / calc["ma60"] - 1) * 100
+    assert 0 < dev20 <= 25, f"close_ma20 应为 0~25%，实际 {dev20:.2f}%"
+    assert dev60 > -5, f"close_ma60 应 >-5%，实际 {dev60:.2f}%"
+    assert rows[-1]["pct_chg"] < 8, "启动前一日当日应未涨停"
+    assert check_strategy("v9Limit5", rows, {}) is True
+
+
+def test_check_strategy_v9_limit5_misses():
+    """无涨停基因/当日已涨停/破位/ST 均不应命中。"""
+    # 无涨停基因：纯温和上涨
+    rows = closes_to_rows(_limit5_closes(set()), code="600000", name="测试")
+    assert check_strategy("v9Limit5", rows, {}) is False
+    # 涨停基因足够但当日已涨停（启动当日而非前一日）
+    limit_days = {52, 56, 60, 64, 68, 72, 76, 82, 87, 92, 99}
+    rows = closes_to_rows(_limit5_closes(limit_days), code="600000", name="测试")
+    assert rows[-1]["pct_chg"] >= 8, "测试数据应有当日涨停"
+    assert check_strategy("v9Limit5", rows, {}) is False
+    # 涨停基因足够但收盘破位（MA20下方）
+    rows = closes_to_rows(_limit5_closes({10, 20, 30, 40, 50, 60, 70},
+                                         daily=-0.008), code="600000", name="测试")
+    calc = _calc_indicators_from_rows(rows)
+    assert (calc["close"] / calc["ma20"] - 1) * 100 < 0, "测试数据应破位"
+    assert check_strategy("v9Limit5", rows, {}) is False
+    # ST 不命中
+    rows = closes_to_rows(_limit5_closes({52, 56, 60, 64, 68, 72, 76, 82, 87, 92}),
+                          code="600000", name="ST测试")
+    assert check_strategy("v9Limit5", rows, {}) is False

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """指标计算正确性测试：SMA / RSI / MACD / KDJ / 上下文字段。"""
-from backtest import _sma, _rsi, _macd, _kdj, _market_ok, _pass_max_buy_pct
+from backtest import _sma, _rsi, _macd, _kdj, _market_ok
 from backtest import IndicatorSeries
 from tests.conftest import closes_to_rows, trading_dates
 
@@ -108,22 +108,6 @@ def test_market_ok_strong_lookback_missing():
     # 但指数跌破 MA20 时仍不放行
     assert _market_ok([9.0] * 22, mma, 21,
                       enabled=True, mode="strong", up_days=3) is False
-
-
-def test_max_buy_pct_none_disabled():
-    assert _pass_max_buy_pct(20.0, None) is True
-    assert _pass_max_buy_pct(20.0, 0) is True
-    assert _pass_max_buy_pct(20.0, -5) is True
-
-
-def test_max_buy_pct_boundary():
-    assert _pass_max_buy_pct(6.0, 6.0) is True   # 恰好等于阈值 -> 放行
-    assert _pass_max_buy_pct(6.01, 6.0) is False
-    assert _pass_max_buy_pct(-3.0, 6.0) is True
-
-
-def test_max_buy_pct_missing_pct():
-    assert _pass_max_buy_pct(None, 6.0) is True
 
 
 # ---------- IndicatorSeries ----------

@@ -53,6 +53,210 @@ def random_market(n_codes=30, n_days=160, seed=7):
     return data
 
 
+# ---------- 扫描/回测判定一致性（judge_at 两端同源） ----------
+def test_judge_at_matches_manual_scan_path():
+    """judge_at（factor 分支）== 手动复刻的扫描判定路径，逐股逐日一致。
+
+    扫描端 process 与回测买入段共用 judge_at，此测试固化『同一数据同一条件
+    命中集合完全相同』，防止两端判定再次分叉。
+    """
+    from backtest import IndicatorSeries, judge_at
+    from screen_common import (DEFAULT_SCAN_FILTERS, evaluate_buy, score_factor_local)
+    from strategy_schema import build_factor_defs, build_rules_map
+
+    data = random_market(n_codes=15, n_days=120, seed=11)
+    fdefs = build_factor_defs(None)
+    rmap = build_rules_map(None)
+    min_score, max_buy_pct = 48.0, 6.0
+    checked = 0
+    for code, rows in data.items():
+        s = IndicatorSeries(code, rows)
+        for date in s.dates[5:]:
+            r = judge_at(s, date, DEFAULT_SCAN_FILTERS, True, max_buy_pct,
+                         min_score, fdefs, rmap, True, "factor_default")
+            i = s.index_at(date)
+            recent = s.rows[max(0, i - 4):i + 1]
+            ind = s.indicator_at(date)
+            scored = score_factor_local(fdefs, recent, ind, rmap)
+            v = evaluate_buy(code, recent, ind, {}, DEFAULT_SCAN_FILTERS, True,
+                             max_buy_pct, strat_hit=scored["total"] >= min_score,
+                             score=scored["total"])
+            assert (r is not None) == v["ok"], (code, date, r, v)
+            if r is not None:
+                assert r["scored"]["total"] == scored["total"], (code, date)
+            checked += 1
+    assert checked > 100
+
+
+def test_judge_at_v9_matches_manual():
+    """judge_at（v9 分支：check_strategy 硬条件 + 综合分排序）== 手动复刻。"""
+    from backtest import IndicatorSeries, judge_at
+    from screen_common import (DEFAULT_SCAN_FILTERS, evaluate_buy, score_factor_local)
+    from strategies import check_strategy
+    from strategy_schema import build_factor_defs, build_rules_map
+
+    data = random_market(n_codes=15, n_days=120, seed=13)
+    fdefs = build_factor_defs(None)
+    rmap = build_rules_map(None)
+    checked = 0
+    for code, rows in data.items():
+        s = IndicatorSeries(code, rows)
+        for date in s.dates[5:]:
+            r = judge_at(s, date, DEFAULT_SCAN_FILTERS, True, None, 0.0,
+                         fdefs, rmap, False, "v9B1")
+            i = s.index_at(date)
+            recent = s.rows[max(0, i - 4):i + 1]
+            ind = s.indicator_at(date)
+            if not check_strategy("v9B1", s.rows[:i + 1], {}, ind):
+                assert r is None, (code, date)
+            else:
+                scored = score_factor_local(fdefs, recent, ind, rmap)
+                v = evaluate_buy(code, recent, ind, {}, DEFAULT_SCAN_FILTERS, True,
+                                 None, strat_hit=True, score=scored["total"])
+                assert (r is not None) == v["ok"], (code, date)
+                if r is not None:
+                    assert r["scored"]["total"] == scored["total"], (code, date)
+            checked += 1
+    assert checked > 100
+
+
+def test_judge_at_v9_limit5_matches_manual():
+    """v9Limit5 连板启动前一日策略：judge_at（v9 分支）== 手动复刻，
+    且构造的启动前一日形态在扫描与回测两端一致命中。"""
+    from backtest import IndicatorSeries, judge_at
+    from screen_common import (DEFAULT_SCAN_FILTERS, evaluate_buy, score_factor_local)
+    from strategies import check_strategy
+    from strategy_schema import build_factor_defs, build_rules_map
+
+    data = random_market(n_codes=15, n_days=120, seed=23)
+    fdefs = build_factor_defs(None)
+    rmap = build_rules_map(None)
+    checked = hits = 0
+    for code, rows in data.items():
+        s = IndicatorSeries(code, rows)
+        for date in s.dates[5:]:
+            r = judge_at(s, date, DEFAULT_SCAN_FILTERS, True, None, 0.0,
+                         fdefs, rmap, False, "v9Limit5")
+            i = s.index_at(date)
+            recent = s.rows[max(0, i - 4):i + 1]
+            ind = s.indicator_at(date)
+            if not check_strategy("v9Limit5", s.rows[:i + 1], {}, ind):
+                assert r is None, (code, date)
+            else:
+                hits += 1
+                scored = score_factor_local(fdefs, recent, ind, rmap)
+                v = evaluate_buy(code, recent, ind, {}, DEFAULT_SCAN_FILTERS, True,
+                                 None, strat_hit=True, score=scored["total"])
+                assert (r is not None) == v["ok"], (code, date)
+                if r is not None:
+                    assert r["scored"]["total"] == scored["total"], (code, date)
+            checked += 1
+    assert checked > 100
+    assert hits == 0, "随机市场不应命中 v9Limit5（无需固定命中）"
+
+
+def test_judge_at_v9_limit5_hits_on_prelaunch_shape():
+    """构造连板启动前一日形态时，judge_at 两端一致命中（扫描/回测同源）。"""
+    from backtest import IndicatorSeries, judge_at
+    from screen_common import (DEFAULT_SCAN_FILTERS, evaluate_buy, score_factor_local)
+    from strategies import check_strategy
+    from strategy_schema import build_factor_defs, build_rules_map
+
+    limit_days = {52, 56, 60, 64, 68, 72, 76, 82, 87, 92}
+    closes = [10.0]
+    for j in range(1, 100):
+        if j in limit_days:
+            closes.append(round(closes[-1] * 1.10, 2))
+        else:
+            closes.append(round(closes[-1] * 1.004, 2))
+    rows = closes_to_rows(closes, code="600000", name="测试")
+    s = IndicatorSeries("600000", rows)
+    fdefs = build_factor_defs(None)
+    rmap = build_rules_map(None)
+    checked = hits = 0
+    for date in s.dates[5:]:
+        i = s.index_at(date)
+        recent = s.rows[max(0, i - 4):i + 1]
+        ind = s.indicator_at(date)
+        manual = check_strategy("v9Limit5", s.rows[:i + 1], {}, ind)
+        r = judge_at(s, date, DEFAULT_SCAN_FILTERS, True, None, 0.0,
+                     fdefs, rmap, False, "v9Limit5")
+        if not manual:
+            assert r is None, (date, "手动不命中但 judge_at 命中")
+        else:
+            hits += 1
+            scored = score_factor_local(fdefs, recent, ind, rmap)
+            v = evaluate_buy("600000", recent, ind, {}, DEFAULT_SCAN_FILTERS, True,
+                             None, strat_hit=True, score=scored["total"])
+            assert (r is not None) == v["ok"], (date, r, v)
+        checked += 1
+    assert hits > 0, "构造的启动前一日形态应在至少一个交易日命中"
+    assert checked > 90
+
+
+def test_judge_at_return_fail_keeps_verdict_for_scan():
+    """judge_at(return_fail=True)：判定不通过也返回 verdict（ok=False），
+    扫描端据此展示灰/绿候选；return_fail=False 仍返回 None（回测买入段）。
+    """
+    from backtest import IndicatorSeries, judge_at
+    from screen_common import DEFAULT_SCAN_FILTERS
+    from strategy_schema import build_factor_defs, build_rules_map
+
+    data = random_market(n_codes=15, n_days=120, seed=17)
+    fdefs = build_factor_defs(None)
+    rmap = build_rules_map(None)
+    min_score, max_buy_pct = 999.0, 6.0  # min_score 极高 → 策略必不命中
+    hit_fail = miss_fail = 0
+    for code, rows in data.items():
+        s = IndicatorSeries(code, rows)
+        for date in s.dates[5:]:
+            r0 = judge_at(s, date, DEFAULT_SCAN_FILTERS, True, max_buy_pct,
+                          min_score, fdefs, rmap, True, "factor_default")
+            r1 = judge_at(s, date, DEFAULT_SCAN_FILTERS, True, max_buy_pct,
+                          min_score, fdefs, rmap, True, "factor_default",
+                          return_fail=True)
+            if r0 is None:
+                miss_fail += 1
+                assert r1 is not None, (code, date)
+                assert r1["verdict"]["ok"] is False, (code, date)
+                assert "ok" in r1["verdict"] and "limit_ok" in r1["verdict"], (code, date)
+            else:
+                hit_fail += 1
+                assert r1["verdict"]["ok"] is True, (code, date)
+    # min_score=999 下必然存在不命中样本，且 return_fail 能兜底返回 verdict
+    assert miss_fail > 100
+    assert hit_fail == 0
+
+
+def test_judge_at_return_fail_market_ok_false_still_returns():
+    """return_fail=True 且 market_ok=False（大盘过滤不通过）：仍返回 verdict，
+    limit_ok 为 False（灰色），而不是返回 None 导致扫描结果整体为空。"""
+    from backtest import IndicatorSeries, judge_at
+    from screen_common import DEFAULT_SCAN_FILTERS
+    from strategy_schema import build_factor_defs, build_rules_map
+
+    data = random_market(n_codes=15, n_days=120, seed=19)
+    fdefs = build_factor_defs(None)
+    rmap = build_rules_map(None)
+    min_score, max_buy_pct = 0.0, 6.0  # 策略必命中，但大盘过滤拦截
+    checked = 0
+    for code, rows in data.items():
+        s = IndicatorSeries(code, rows)
+        for date in s.dates[5:]:
+            r0 = judge_at(s, date, DEFAULT_SCAN_FILTERS, False, max_buy_pct,
+                          min_score, fdefs, rmap, True, "factor_default")
+            r1 = judge_at(s, date, DEFAULT_SCAN_FILTERS, False, max_buy_pct,
+                          min_score, fdefs, rmap, True, "factor_default",
+                          return_fail=True)
+            assert r0 is None, (code, date)  # 回测段：大盘过滤不通过不买入
+            assert r1 is not None, (code, date)  # 扫描段：保留候选展示
+            assert r1["verdict"]["ok"] is False, (code, date)
+            assert r1["verdict"]["limit_ok"] is False, (code, date)
+            assert any("大盘" in w for w in r1["verdict"]["warnings"]), (code, date)
+            checked += 1
+    assert checked > 100
+
+
 # ---------- 冒烟 ----------
 def test_run_smoke_returns_structure(monkeypatch):
     _patch(monkeypatch, random_market())
@@ -116,13 +320,14 @@ def test_market_filter_skips_downtrend_buy(monkeypatch):
     dates = trading_dates(60)
 
     _patch(monkeypatch, data)
-    on = run_backtest(dict(BASE_CFG, market_filter=True, min_score=-999.0),
+    on = run_backtest(dict(BASE_CFG, market_filter=True,
+                           market_filter_mode="strong", min_score=-999.0),
                       progress_cb=lambda m, p: None)
     off = run_backtest(dict(BASE_CFG, market_filter=False, min_score=-999.0),
                        progress_cb=lambda m, p: None)
 
-    # 过滤开启：MA20 明显高于指数的下跌段（d20~d35，MA20 从 9.9 降至 8.1）
-    # 不得买入；MA20 追平指数后恢复买入属正常择时行为
+    # 过滤开启（strong 模式）：MA20 明显高于指数的下跌段（d20~d35，MA20
+    # 从 9.9 降至 8.1）不得买入；MA20 追平指数后恢复买入属正常择时行为
     assert on["trades"], "预热期（MA20 未形成）允许买入"
     assert not any(dates[20] <= t["buy_date"] <= dates[35]
                    for t in on["trades"]), \
@@ -134,6 +339,28 @@ def test_market_filter_skips_downtrend_buy(monkeypatch):
     assert len(on["trades"]) < len(off["trades"])
 
 
+# ---------- 大盘过滤（oversold 超卖模式） ----------
+def test_market_filter_oversold_buys_on_dip(monkeypatch):
+    # 单边下跌：指数 RSI 长期超卖（<40），oversold 模式应放行买入
+    closes = [10.0] * 20 + [9.8, 9.6, 9.4, 9.2, 9.0,
+                            8.8, 8.6, 8.4, 8.2, 8.0] + [7.6, 7.4, 7.2, 7.0] * 10
+    _patch(monkeypatch, market_data({"000001": closes}))
+    on = run_backtest(dict(BASE_CFG, market_filter=True,
+                           market_filter_mode="oversold",
+                           market_rsi_threshold=40.0, min_score=-999.0),
+                      progress_cb=lambda m, p: None)
+    # 超卖窗口（RSI<40）应有买入
+    assert on["trades"], "超卖模式应在下跌段放行买入"
+    # 同场景 strong 模式：指数在 MA20 下方，下跌段应禁止买入
+    strong = run_backtest(dict(BASE_CFG, market_filter=True,
+                               market_filter_mode="strong", min_score=-999.0),
+                          progress_cb=lambda m, p: None)
+    dates = trading_dates(len(closes))
+    assert not any(dates[30] <= t["buy_date"] <= dates[45]
+                   for t in strong["trades"]), \
+        [t["buy_date"] for t in strong["trades"]]
+
+
 # ---------- 不追高 ----------
 def test_max_buy_pct_skips_high_gain_day(monkeypatch):
     data = market_data({"A": [10.0] * 60, "B": [10.0] * 60})
@@ -142,7 +369,8 @@ def test_max_buy_pct_skips_high_gain_day(monkeypatch):
     dates = trading_dates(60)
 
     _patch(monkeypatch, data)
-    res = run_backtest(dict(BASE_CFG, min_score=-999.0, max_buy_pct=6.0),
+    res = run_backtest(dict(BASE_CFG, min_score=-999.0, max_buy_pct=6.0,
+                            filters={}),   # 关闭筛选过滤链，单独验证不追高
                        progress_cb=lambda m, p: None)
 
     tb = [t for t in res["trades"] if t["code"] == "B"]
@@ -158,7 +386,8 @@ def test_no_max_buy_pct_buys_any_day(monkeypatch):
     data["A"][0]["pct_chg"] = 8.0
     dates = trading_dates(60)
     _patch(monkeypatch, data)
-    res = run_backtest(dict(BASE_CFG, min_score=-999.0, max_buy_pct=None),
+    res = run_backtest(dict(BASE_CFG, min_score=-999.0, max_buy_pct=None,
+                            filters={}),   # 关闭筛选过滤链，单独验证不追高
                        progress_cb=lambda m, p: None)
     assert res["trades"]
     assert res["trades"][0]["buy_date"] == dates[0]
@@ -174,9 +403,10 @@ def test_dummy_guard():
     assert DEFAULT_BT_CONFIG["hold_days"] == 15
     assert DEFAULT_BT_CONFIG["top_n"] == 10
     assert DEFAULT_BT_CONFIG["init_cash"] == 6000
-    assert DEFAULT_BT_CONFIG["min_score"] == 55.0
+    assert DEFAULT_BT_CONFIG["min_score"] == 48.0
     assert DEFAULT_BT_CONFIG["market_filter"] is True
-    assert DEFAULT_BT_CONFIG["market_filter_mode"] == "strong"
+    assert DEFAULT_BT_CONFIG["market_filter_mode"] == "oversold"
+    assert DEFAULT_BT_CONFIG["market_rsi_threshold"] == 40.0
     assert DEFAULT_BT_CONFIG["max_buy_pct"] == 6.0
 
 
@@ -196,3 +426,192 @@ def test_fit_top_n_to_cash():
     # 边界
     assert _fit_top_n_to_cash(3, 6000) == 3
     assert _fit_top_n_to_cash(25, 0) == 25
+
+
+# ---------- 回测时间条件（窗口/预热天数） ----------
+def test_window_auto_computes_start(monkeypatch):
+    """配置 window 且未指定 start 时，自动按结束日期倒推开区间起始。"""
+    data = random_market(n_days=160)
+    _patch(monkeypatch, data)
+    cfg = dict(BASE_CFG, start="", end="20260430", window="120", pre_days=0)
+    res = run_backtest(cfg, progress_cb=lambda m, p: None)
+    assert res["metrics"]["days"] >= 2
+
+
+def test_pre_days_propagates_to_data_load(monkeypatch):
+    """pre_days 可覆盖默认值并影响加载区间。"""
+    data = random_market(n_days=160)
+    _patch(monkeypatch, data)
+    cfg = dict(BASE_CFG, start="20260101", end="20260430", pre_days=10)
+    res = run_backtest(cfg, progress_cb=lambda m, p: None)
+    assert res["metrics"]["days"] >= 2
+
+
+# ---------- 全量回测（不抽样） ----------
+def test_sampled_universe_full_when_max_codes_zero(monkeypatch):
+    """max_codes<=0 表示全量回测：不抽样，返回全部标的。"""
+    from backtest import _sampled_universe
+    fake = {"600000": [{"date": "2024-01-01"}],
+            "600001": [{"date": "2024-01-01"}],
+            "600002": [{"date": "2024-01-01"}]}
+    monkeypatch.setattr("backtest.load_market_rows", lambda *a, **k: fake)
+    monkeypatch.setattr("backtest._default_start", lambda *a, **k: "2024-01-01")
+    monkeypatch.setattr("backtest._latest_end", lambda *a, **k: "2024-12-31")
+    assert _sampled_universe(["60*"], 0) == ["600000", "600001", "600002"]
+    assert _sampled_universe(["60*"], -1) == ["600000", "600001", "600002"]
+
+
+def test_sampled_universe_still_samples_positive(monkeypatch):
+    """max_codes>0 且少于标的数时仍然抽样（抽样数量受控）。"""
+    from backtest import _sampled_universe
+    fake = {f"6000{i:02d}": [{"date": "2024-01-01"}] for i in range(20)}
+    monkeypatch.setattr("backtest.load_market_rows", lambda *a, **k: fake)
+    monkeypatch.setattr("backtest._default_start", lambda *a, **k: "2024-01-01")
+    monkeypatch.setattr("backtest._latest_end", lambda *a, **k: "2024-12-31")
+    out = _sampled_universe(["60*"], 5)
+    assert len(out) == 5
+    assert len(set(out)) == 5
+
+
+# ---------- 回测买入判定与扫描共用 evaluate_buy ----------
+def test_backtest_buy_uses_shared_evaluate_buy(monkeypatch):
+    """回测买入段必须走 screen_common.evaluate_buy（而非内联重复实现），
+    保证扫描/回测两端判定逻辑完全一致。"""
+    import backtest
+    calls = []
+    real = backtest.evaluate_buy
+
+    def spy(code, valid, ind, online, filters, market_ok, max_buy_pct,
+            strat_hit, score=0.0, warnings=None):
+        calls.append(dict(online=online, market_ok=market_ok,
+                          max_buy_pct=max_buy_pct))
+        return real(code, valid, ind, online, filters, market_ok,
+                    max_buy_pct, strat_hit, score=score, warnings=warnings)
+
+    monkeypatch.setattr("backtest.evaluate_buy", spy)
+    _patch(monkeypatch, market_data({
+        "000001": [10.0] * 60,
+        "000002": [10.0] * 60,
+    }))
+    res = run_backtest(
+        dict(BASE_CFG, min_score=-999.0, market_filter=False,
+             max_buy_pct=6.0),
+        progress_cb=lambda m, p: None)
+    assert calls, "回测买入段必须调用共享 evaluate_buy"
+    assert all(c["online"] == {} for c in calls), "回测无历史在线数据，online 恒为 {}"
+    assert all(c["market_ok"] for c in calls), "market_filter=False 时大盘恒放行"
+    assert all(c["max_buy_pct"] == 6.0 for c in calls), "max_buy_pct 应原样透传"
+    assert res["trades"], "应产生买入"
+
+
+def test_backtest_buy_respects_evaluate_buy_no_chase(monkeypatch):
+    """回测不追高由 evaluate_buy 统一判定：当日 pct_chg 超阈值不买入。"""
+    import backtest
+    blocked = []
+    real = backtest.evaluate_buy
+
+    def spy(code, valid, ind, online, filters, market_ok, max_buy_pct,
+            strat_hit, score=0.0, warnings=None):
+        v = real(code, valid, ind, online, filters, market_ok,
+                 max_buy_pct, strat_hit, score=score, warnings=warnings)
+        if not v["no_chase_ok"]:
+            blocked.append(code)
+        return v
+
+    monkeypatch.setattr("backtest.evaluate_buy", spy)
+    data = market_data({"A": [10.0] * 60, "B": [10.0] * 60})
+    data["A"][0]["pct_chg"] = 8.0
+    dates = trading_dates(60)
+    _patch(monkeypatch, data)
+    res = run_backtest(
+        dict(BASE_CFG, min_score=-999.0, max_buy_pct=6.0, filters={}),
+        progress_cb=lambda m, p: None)
+    assert "A" in blocked, "高涨幅股票当日应被不追高判定拦截"
+    tb = [t for t in res["trades"] if t["code"] == "B"]
+    assert tb and tb[0]["buy_date"] == dates[0]
+
+
+# ---------- 扫描端大盘过滤（与回测同口径：全池等权指数） ----------
+def _idx_rows(closes):
+    """把一组收盘价序列包装成 rows_by_code（单只股票即为等权指数）。"""
+    from tests.conftest import closes_to_rows, trading_dates
+    return {"000001": closes_to_rows(closes, code="000001",
+                                     dates=trading_dates(len(closes)))}
+
+
+def test_scan_market_ok_no_data_returns_true():
+    """无任何K线数据时大盘过滤放行，避免误伤。"""
+    from backtest import scan_market_ok
+    assert scan_market_ok({}) is True
+
+
+def test_scan_market_ok_uptrend_strong_allows():
+    """指数单边上行且站上 MA20：strong 模式允许买入。"""
+    from backtest import scan_market_ok
+    closes = [10 + i * 0.2 for i in range(30)]   # 10 → 15.8 单边上行
+    assert scan_market_ok(_idx_rows(closes), mode="strong") is True
+
+
+def test_scan_market_ok_downtrend_strong_blocks():
+    """指数单边下行（低于 MA20）：strong 模式禁止买入。"""
+    from backtest import scan_market_ok
+    closes = [15 - i * 0.2 for i in range(30)]   # 15 → 9.2 单边下行
+    assert scan_market_ok(_idx_rows(closes), mode="strong") is False
+
+
+def test_scan_market_ok_flat_strong_blocks():
+    """指数横盘（MA20 走平）：strong 模式要求 MA20 上行，不放行。"""
+    from backtest import scan_market_ok
+    closes = [10.0] * 30
+    assert scan_market_ok(_idx_rows(closes), mode="strong") is False
+
+
+def test_scan_market_ok_downtrend_oversold_allows():
+    """指数单边下行（RSI 超卖<40）：oversold 模式放行买入。"""
+    from backtest import scan_market_ok
+    closes = [15 - i * 0.2 for i in range(30)]
+    assert scan_market_ok(_idx_rows(closes), mode="oversold",
+                          rsi_threshold=40.0) is True
+
+
+def test_scan_market_ok_uptrend_oversold_blocks():
+    """指数单边上行（RSI 高位≥40）：oversold 模式禁止买入。"""
+    from backtest import scan_market_ok
+    closes = [10 + i * 0.2 for i in range(30)]
+    assert scan_market_ok(_idx_rows(closes), mode="oversold",
+                          rsi_threshold=40.0) is False
+
+
+def test_scan_market_ok_forwards_mode_and_up_days(monkeypatch):
+    """scan_market_ok 将 mode/up_days/rsi_threshold/深度条件 原样转发给
+    _market_ok，供 main.py 按 DEFAULT_BT_CONFIG 传入，保证两端大盘口径一致。"""
+    from backtest import scan_market_ok
+    seen = {}
+
+    def fake_market_ok(mc, mma, di, enabled, mode, up_days, rsi_threshold,
+                       chg20_max, chg20_max2, chg60_min):
+        seen.update(mode=mode, up_days=up_days, enabled=enabled,
+                    rsi_threshold=rsi_threshold, chg20_max=chg20_max,
+                    chg20_max2=chg20_max2, chg60_min=chg60_min)
+        return True
+
+    monkeypatch.setattr("backtest._market_ok", fake_market_ok)
+    closes = [10 + i * 0.1 for i in range(30)]
+    assert scan_market_ok(_idx_rows(closes), mode="above", up_days=5,
+                          rsi_threshold=35.0) is True
+    assert seen == {"mode": "above", "up_days": 5, "enabled": True,
+                    "rsi_threshold": 35.0, "chg20_max": None,
+                    "chg20_max2": None, "chg60_min": None}
+    assert scan_market_ok(_idx_rows(closes), mode="oversold", up_days=5,
+                          rsi_threshold=40.0, chg20_max=-14.0,
+                          chg20_max2=-10.0, chg60_min=0.0) is True
+    assert seen == {"mode": "oversold", "up_days": 5, "enabled": True,
+                    "rsi_threshold": 40.0, "chg20_max": -14.0,
+                    "chg20_max2": -10.0, "chg60_min": 0.0}
+
+
+def test_scan_market_ok_mode_above_allows_flat():
+    """mode='above' 仅要求指数高于 MA20：横盘时放行（与 strong 区分）。"""
+    from backtest import scan_market_ok
+    closes = [10.0] * 30
+    assert scan_market_ok(_idx_rows(closes), mode="above") is True

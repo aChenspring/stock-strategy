@@ -14,6 +14,7 @@ from math import isfinite
 _ss = types.ModuleType("stock_sdk")
 _ss.rd = None
 _ss.bk = None
+_ss.zb = None
 _ss.warm_default_connection = lambda: None
 _ss.is_login = lambda: True
 sys.modules["stock_sdk"] = _ss
@@ -22,9 +23,53 @@ sys.modules["stock_sdk"] = _ss
 _sd = types.ModuleType("strategy_data")
 _sd.END = "20260821"
 _sd.A_SHARE_PREFIXES = ["sh60", "sz00", "sz30"]
-_sd._finite = lambda v: isinstance(v, (int, float)) and isfinite(v)
+_sd._finite = lambda v: v if isinstance(v, (int, float)) and isfinite(v) else None
 _sd.valid_trading_rows = lambda rows: rows
 _sd.load_market_rows = lambda prefixes, start, end: {}
+# factors 顶层会 from strategy_data import compute_board_env / compute_market_env；
+# mock 需补齐这两个名字（score_factor_local 的 ctx 摊平不调用它们，仅保证导入成功）
+_sd.compute_board_env = lambda rows, info_map=None: {}
+_sd.compute_market_env = lambda rows: {}
+
+
+def _shift_days(date_str, days):
+    from datetime import datetime, timedelta
+    return (datetime.strptime(date_str, "%Y%m%d") + timedelta(days=days)).strftime("%Y%m%d")
+
+
+def _shift_months(date_str, months):
+    from datetime import datetime
+    dt = datetime.strptime(date_str, "%Y%m%d")
+    year = dt.year
+    month = dt.month + months
+    year += (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    max_day = [31, 29 if (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0) else 28,
+               31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+    day = min(dt.day, max_day)
+    return f"{year:04d}{month:02d}{day:02d}"
+
+
+def _calc_window_start(end_date, window):
+    if not end_date:
+        end_date = _sd.END
+    w = str(window).strip().lower()
+    if w.endswith("m"):
+        return _shift_months(end_date, -int(w[:-1]))
+    if w.endswith("y"):
+        return _shift_months(end_date, -int(w[:-1]) * 12)
+    if w.isdigit():
+        return _shift_days(end_date, -int(w) * 2)
+    return _shift_months(end_date, -6)
+
+
+_sd.shift_days = _shift_days
+_sd.shift_months = _shift_months
+_sd.calc_window_start = _calc_window_start
+_sd.calc_backtest_pre_start = lambda end_date, window, pre_days=60: (
+    _calc_window_start(end_date, window),
+    _shift_days(_calc_window_start(end_date, window), -pre_days * 2),
+)
 sys.modules["strategy_data"] = _sd
 
 

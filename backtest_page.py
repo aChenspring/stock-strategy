@@ -26,6 +26,7 @@ from strategy_schema import (
     load_strategy_config, build_factor_defs,
 )
 from backtest import run_backtest, DEFAULT_BT_CONFIG
+from strategy_data import calc_window_start, END
 
 BT_RESULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "backtest_results")
@@ -163,10 +164,26 @@ class BacktestPage(QWidget):
             self.cb_strategy.addItem(f"{s['name']} ({s['key']})", s["key"])
         self.cb_strategy.currentIndexChanged.connect(self._on_strategy_changed)
 
-        self.ed_start = QLineEdit("")
-        self.ed_start.setPlaceholderText("留空=最近120交易日")
+        self.cb_window = QComboBox()
+        self.cb_window.addItem("自定义", "")
+        self.cb_window.addItem("30个交易日", "30")
+        self.cb_window.addItem("60个交易日", "60")
+        self.cb_window.addItem("120个交易日", "120")
+        self.cb_window.addItem("250个交易日", "250")
+        self.cb_window.addItem("500个交易日", "500")
+        self.cb_window.setCurrentIndex(0)
+        self.cb_window.setToolTip("选择区间长度后，起始日期会自动根据结束日期倒推")
+
         self.ed_end = QLineEdit("")
         self.ed_end.setPlaceholderText("留空=最新交易日")
+
+        self.ed_start = QLineEdit("")
+        self.ed_start.setPlaceholderText("留空=按区间长度自动算")
+        self.ed_start.setEnabled(False)
+
+        self.ed_pre_days = QLineEdit("60")
+        self.ed_pre_days.setToolTip("指标预热所需交易日数，影响均线/动量类因子能计算到多远")
+
         self.ed_cash = QLineEdit("6000")
         self.ed_topn = QLineEdit("10")
         self.ed_topn.setToolTip(
@@ -181,19 +198,49 @@ class BacktestPage(QWidget):
         self.cb_universe = QComboBox()
         # 默认全A：每个历史交易日站在当日视角重新打分选股，避免拿当前选股套历史（前视偏差）
         self.cb_universe.addItem("全A（抽样）·逐日历史选股", "all")
+        self.cb_universe.addItem("全A（全量）·逐日历史选股", "all_full")
         self.cb_universe.addItem("上次扫描命中池·仅验证当前选股", "hits")
         self.cb_universe.setToolTip(
             "全A（抽样）：在每个历史交易日用当日数据重新打分选股，"
-            "买入/卖出价均为历史当日价格，无前视偏差。\n"
+            "买入/卖出价均为历史当日价格，无前视偏差，速度快。\n"
+            "全A（全量）：与抽样同一套判定代码，但覆盖全部A股标的，"
+            "耗时显著增加，用于和抽样结果对比评估。\n"
             "上次扫描命中池：仅用当前扫描选出的股票做历史回放，"
             "存在前视/选择偏差，仅用于验证当前选股的历史表现，结果偏乐观。")
         self.cb_universe.currentIndexChanged.connect(self._on_universe_changed)
+        self.cb_window.currentIndexChanged.connect(self._on_window_changed)
+        self.ed_end.textChanged.connect(self._on_window_changed)
         self.ed_maxcodes = QLineEdit("400")
+        # 初始化一次，确保自定义模式正确解锁/锁定起始日期
+        self._on_window_changed()
         self.chk_market = QCheckBox("大盘过滤")
         self.chk_market.setChecked(True)
         self.chk_market.setToolTip(
-            "回测区间内，全池等权指数跌破其 20 日线时跳过买入（空仓等待），"
-            "可大幅减少震荡/下跌市的无效交易与回撤。")
+            "回测区间内，按选定的大盘过滤模式判断入场时机，不满足时空仓等待。\n"
+            "strong=全池等权指数在20日线上方且20日线上行（强势市）；\n"
+            "oversold=指数RSI14低于阈值(默认40)的超卖反弹入场，"
+            "配合下方深度条件可实现「深度超卖V型反弹」与「牛市回调」入场。")
+        self.cb_market_mode = QComboBox()
+        self.cb_market_mode.addItem("超卖反弹(RSI14<40)", "oversold")
+        self.cb_market_mode.addItem("强势(20日线上方且上行)", "strong")
+        self.cb_market_mode.addItem("弱过滤(20日线上方)", "above")
+        self.cb_market_mode.setCurrentIndex(0)
+        self.cb_market_mode.setToolTip(
+            "oversold=指数RSI14<40的超卖反弹入场（均值回归市显著占优，全量回测最优）；\n"
+            "strong=指数>20日线且20日线上行；above=指数>20日线即可。")
+        self.ed_mkt_chg20 = QLineEdit("-14")
+        self.ed_mkt_chg20.setToolTip(
+            "oversold 深度主条件：大盘20日跌幅低于该值(%)才买入，如 -14。\n"
+            "留空=关闭（仅用 RSI14<40 判断）。默认 -14 为全量回测挖掘出的"
+            "「深度超卖V型反弹」最优阈值。")
+        self.ed_mkt_chg20b = QLineEdit("-10")
+        self.ed_mkt_chg20b.setToolTip(
+            "oversold 次条件「牛市回调」：主条件未满足时，20日跌幅达到该值(%)"
+            "（较浅，如 -10）且满足下方60日趋势条件也可入场。留空=关闭。")
+        self.ed_mkt_chg60 = QLineEdit("0")
+        self.ed_mkt_chg60.setToolTip(
+            "oversold 次条件：60日涨幅高于该值(%)才算上升趋势，如 0。"
+            "配合次级阈值实现「上升趋势中的回调买入」。留空=不限。")
         self.ed_maxbuy = QLineEdit("6")
         self.ed_maxbuy.setToolTip(
             "调仓日当日涨幅超过该值(%)的股票不追高买入（避免买在情绪高点/涨停日）；"
@@ -201,32 +248,46 @@ class BacktestPage(QWidget):
 
         grid.addWidget(QLabel("策略"), 0, 0)
         grid.addWidget(self.cb_strategy, 0, 1)
-        grid.addWidget(QLabel("起止日期"), 0, 2)
-        grid.addWidget(self.ed_start, 0, 3)
-        grid.addWidget(self.ed_end, 0, 4)
-        grid.addWidget(QLabel("初始资金"), 1, 0)
-        grid.addWidget(self.ed_cash, 1, 1)
-        grid.addWidget(QLabel("买入TopN"), 1, 2)
-        grid.addWidget(self.ed_topn, 1, 3)
-        grid.addWidget(QLabel("持有天数"), 1, 4)
-        grid.addWidget(self.ed_hold, 1, 5)
-        grid.addWidget(QLabel("单边费率"), 2, 0)
-        grid.addWidget(self.ed_fee, 2, 1)
-        grid.addWidget(QLabel("买入门槛分"), 2, 2)
-        grid.addWidget(self.ed_minscore, 2, 3)
-        grid.addWidget(QLabel("止损%"), 2, 4)
-        grid.addWidget(self.ed_stop, 2, 5)
-        grid.addWidget(QLabel("止盈%"), 3, 0)
-        grid.addWidget(self.ed_profit, 3, 1)
-        grid.addWidget(QLabel("调仓间隔(日)"), 3, 2)
-        grid.addWidget(self.ed_rebal, 3, 3)
-        grid.addWidget(QLabel("标的池"), 3, 4)
-        grid.addWidget(self.cb_universe, 3, 5)
-        grid.addWidget(QLabel("最大标的数"), 4, 0)
-        grid.addWidget(self.ed_maxcodes, 4, 1)
-        grid.addWidget(self.chk_market, 4, 2)
-        grid.addWidget(QLabel("不追高涨幅%"), 4, 3)
-        grid.addWidget(self.ed_maxbuy, 4, 4)
+        grid.addWidget(QLabel("区间长度"), 0, 2)
+        grid.addWidget(self.cb_window, 0, 3)
+        grid.addWidget(QLabel("结束"), 0, 4)
+        grid.addWidget(self.ed_end, 0, 5)
+
+        grid.addWidget(QLabel("起始"), 1, 0)
+        grid.addWidget(self.ed_start, 1, 1)
+        grid.addWidget(QLabel("预热天数"), 1, 2)
+        grid.addWidget(self.ed_pre_days, 1, 3)
+        grid.addWidget(QLabel("初始资金"), 1, 4)
+        grid.addWidget(self.ed_cash, 1, 5)
+
+        grid.addWidget(QLabel("买入TopN"), 2, 0)
+        grid.addWidget(self.ed_topn, 2, 1)
+        grid.addWidget(QLabel("持有天数"), 2, 2)
+        grid.addWidget(self.ed_hold, 2, 3)
+        grid.addWidget(QLabel("单边费率"), 2, 4)
+        grid.addWidget(self.ed_fee, 2, 5)
+        grid.addWidget(QLabel("买入门槛分"), 3, 0)
+        grid.addWidget(self.ed_minscore, 3, 1)
+        grid.addWidget(QLabel("止损%"), 3, 2)
+        grid.addWidget(self.ed_stop, 3, 3)
+        grid.addWidget(QLabel("止盈%"), 3, 4)
+        grid.addWidget(self.ed_profit, 3, 5)
+        grid.addWidget(QLabel("调仓间隔(日)"), 4, 0)
+        grid.addWidget(self.ed_rebal, 4, 1)
+        grid.addWidget(QLabel("标的池"), 4, 2)
+        grid.addWidget(self.cb_universe, 4, 3)
+        grid.addWidget(QLabel("最大标的数"), 4, 4)
+        grid.addWidget(self.ed_maxcodes, 4, 5)
+        grid.addWidget(self.chk_market, 5, 0)
+        grid.addWidget(self.cb_market_mode, 5, 1)
+        grid.addWidget(QLabel("不追高涨幅%"), 5, 2)
+        grid.addWidget(self.ed_maxbuy, 5, 3)
+        grid.addWidget(QLabel("深跌20日%"), 6, 0)
+        grid.addWidget(self.ed_mkt_chg20, 6, 1)
+        grid.addWidget(QLabel("回调20日%"), 6, 2)
+        grid.addWidget(self.ed_mkt_chg20b, 6, 3)
+        grid.addWidget(QLabel("60日趋势%"), 6, 4)
+        grid.addWidget(self.ed_mkt_chg60, 6, 5)
 
         self.btn_run = QPushButton("运行回测")
         self.btn_run.clicked.connect(self._run)
@@ -240,12 +301,12 @@ class BacktestPage(QWidget):
         btns.addWidget(self.btn_run)
         btns.addWidget(self.btn_stop)
         btns.addWidget(self.btn_save)
-        grid.addLayout(btns, 5, 0, 1, 6)
+        grid.addLayout(btns, 7, 0, 1, 6)
 
         self.lbl_coverage = QLabel("")
         self.lbl_coverage.setWordWrap(True)
         self.lbl_coverage.setStyleSheet("color:#666;")
-        grid.addWidget(self.lbl_coverage, 6, 0, 1, 6)
+        grid.addWidget(self.lbl_coverage, 8, 0, 1, 6)
 
         root.addWidget(cfg_box)
 
@@ -355,6 +416,22 @@ class BacktestPage(QWidget):
     def _on_universe_changed(self):
         self._refresh_coverage()
 
+    def _on_window_changed(self):
+        """区间长度/结束日期变化时，自动推算起始日期（自定义时不自动填充）。"""
+        window = self.cb_window.currentData()
+        if not window:
+            self.ed_start.setEnabled(True)
+            return
+        self.ed_start.setEnabled(False)
+        end_date = self.ed_end.text().strip()
+        if not end_date:
+            end_date = END
+        try:
+            start = calc_window_start(end_date, window)
+            self.ed_start.setText(start)
+        except Exception:
+            pass
+
     def _refresh_coverage(self):
         mode = self.cb_universe.currentData()
         if mode == "hits":
@@ -362,6 +439,11 @@ class BacktestPage(QWidget):
                 self._lbl_coverage_base +
                 " | 标的池=上次扫描命中池：仅验证当前选股的历史表现，"
                 "存在前视/选择偏差，结果偏乐观")
+        elif mode == "all_full":
+            self.lbl_coverage.setText(
+                self._lbl_coverage_base +
+                " | 标的池=全A(全量)：覆盖全部A股标的、不抽样，"
+                "与抽样共用同一套筛选判定代码，可对比验证抽样效果")
         else:
             self.lbl_coverage.setText(
                 self._lbl_coverage_base +
@@ -383,6 +465,8 @@ class BacktestPage(QWidget):
             "strategy": self.cb_strategy.currentData(),
             "start": self.ed_start.text().strip(),
             "end": self.ed_end.text().strip(),
+            "window": self.cb_window.currentData(),
+            "pre_days": int(_f(self.ed_pre_days, DEFAULT_BT_CONFIG["pre_days"])),
             "init_cash": _f(self.ed_cash, DEFAULT_BT_CONFIG["init_cash"]),
             "top_n": int(_f(self.ed_topn, DEFAULT_BT_CONFIG["top_n"])),
             "hold_days": int(_f(self.ed_hold, DEFAULT_BT_CONFIG["hold_days"])),
@@ -392,10 +476,17 @@ class BacktestPage(QWidget):
             "take_profit": _f(self.ed_profit, DEFAULT_BT_CONFIG["take_profit"]),
             "rebalance_every": max(1, int(_f(self.ed_rebal, DEFAULT_BT_CONFIG["rebalance_every"]))),
             "universe": self.cb_universe.currentData(),
-            "max_codes": int(_f(self.ed_maxcodes, 400)),
+            "max_codes": (0 if self.cb_universe.currentData() == "all_full"
+                          else int(_f(self.ed_maxcodes, 400))),
             "market_filter": self.chk_market.isChecked(),
-            "market_filter_mode": "strong",   # 指数>20日线 且 20日线走多
+            "market_filter_mode": self.cb_market_mode.currentData(),
             "ma_up_days": 3,
+            "market_chg20_max": (lambda s: None if not s.strip() else
+                                 float(s))(self.ed_mkt_chg20.text()),
+            "market_chg20_max2": (lambda s: None if not s.strip() else
+                                  float(s))(self.ed_mkt_chg20b.text()),
+            "market_chg60_min": (lambda s: None if not s.strip() else
+                                 float(s))(self.ed_mkt_chg60.text()),
             "max_buy_pct": (lambda s: None if not s.strip() else
                             (_f(self.ed_maxbuy, DEFAULT_BT_CONFIG["max_buy_pct"]) or None))(
                 self.ed_maxbuy.text()),
